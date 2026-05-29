@@ -1,0 +1,61 @@
+# ============================================================
+# LoongCollector Config Server — Admin mode (distributed)
+# Run: ./admin -config config.admin.yaml
+#
+# Admin mode serves only the management REST API and WebUI.
+# It requires MySQL (shared DB) + Redis (shared cache/pubsub).
+# Agent heartbeats are handled by the separate configserver binary.
+#
+# Priority: environment variables > this file > built-in defaults
+# ============================================================
+
+# ── Database ─────────────────────────────────────────────────
+# Distributed mode requires MySQL. SQLite is not supported here
+# because multiple processes must share the same database.
+database:
+  driver: mysql
+  # MySQL DSN format:
+  #   user:password@tcp(host:port)/dbname?param=value
+  # Required params for correctness:
+  #   charset=utf8mb4  — full Unicode (emoji, CJK, etc.)
+  #   parseTime=True   — map DATETIME → time.Time
+  #   loc=Local        — use server local timezone
+  dsn: "configserver:s3cr3t@tcp(mysql:3306)/configserver?charset=utf8mb4&parseTime=True&loc=Local"
+  # Connection pool (applies to both SQLite and MySQL)
+  pool:
+    max_open_conns:    25    # max concurrent connections
+    max_idle_conns:    10    # idle connections to keep open
+    conn_max_lifetime: 3600  # seconds before a connection is recycled
+    conn_max_idle_time: 600  # seconds before an idle connection is closed
+# ── Redis ─────────────────────────────────────────────────────
+# Required in distributed mode for L2 cache and pub/sub
+# invalidation between admin and configserver processes.
+redis:
+  addr: "redis:6379"   # host:port; for Redis Cluster list comma-separated addrs
+  password: ""          # Redis AUTH password; empty = no auth
+  db: 0                 # Redis logical database index (0–15)
+
+# ── In-process cache (L1 freecache) ──────────────────────────
+cache:
+  l1_max_size_mb: 100   # Maximum L1 cache size in MiB
+  l1_ttl: 5m            # L1 entry TTL
+  l2_ttl: 720h          # L2 (Redis) entry TTL (30 days)
+
+# ── Agent API server ──────────────────────────────────────────
+# Admin mode does NOT listen for agent connections.
+# This section is present for completeness but has no effect
+# when running the admin binary.
+agent_server:
+  host: "0.0.0.0"
+  port: 8080
+
+# ── Admin API / WebUI server ──────────────────────────────────
+admin_server:
+  host: "0.0.0.0"
+  port: 8081
+
+# ── Metrics ───────────────────────────────────────────────────
+metrics:
+  push_url: ""                 # e.g. "http://vmagent:8429/api/v1/import/prometheus"
+  push_interval: 30s
+  online_window: 5m            # Agents silent longer than this are counted as offline

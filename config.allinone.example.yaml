@@ -1,0 +1,63 @@
+# ============================================================
+# LoongCollector Config Server — All-in-One mode
+# Run: ./allinone -config config.allinone.yaml
+#
+# All-in-One runs the Agent API and Admin WebUI in a single
+# process. Redis is NOT used; state is shared in-process.
+# Default storage is SQLite; MySQL can be switched in below.
+#
+# Priority: environment variables > this file > built-in defaults
+# Any field can be overridden at runtime via env vars, e.g.:
+#   CONFIGSERVER_ADMIN_PORT=9090 ./allinone -config config.allinone.yaml
+# ============================================================
+
+# ── Database ─────────────────────────────────────────────────
+database:
+  # driver: sqlite | mysql
+  driver: sqlite
+  # SQLite: path to the database file.
+  dsn: configserver.db
+  # MySQL example (uncomment and switch driver to "mysql"):
+  # driver: mysql
+  # dsn: "user:password@tcp(127.0.0.1:3306)/configserver?charset=utf8mb4&parseTime=True&loc=Local"
+  # Connection pool (applies to both SQLite and MySQL)
+  pool:
+    max_open_conns:    25    # max concurrent connections
+    max_idle_conns:    10    # idle connections to keep open
+    conn_max_lifetime: 3600  # seconds before a connection is recycled
+    conn_max_idle_time: 600  # seconds before an idle connection is closed
+# ── Redis ─────────────────────────────────────────────────────
+# Redis is optional in All-in-One mode (L1 + DB is sufficient).
+# Uncomment to enable L2 caching (useful if you later scale out).
+redis:
+  addr: ""         # e.g. "127.0.0.1:6379"  — leave empty to disable
+  password: ""     # Redis AUTH password; empty = no auth
+  db: 0            # Redis logical database index (0–15)
+
+# ── In-process cache (L1 freecache) ──────────────────────────
+cache:
+  l1_max_size_mb: 100   # Maximum L1 cache size in MiB
+  l1_ttl: 5m            # L1 entry TTL (Go duration: 5m, 10m, 1h …)
+  l2_ttl: 720h          # L2 (Redis) entry TTL; ignored when Redis is disabled
+
+# ── Agent API server ──────────────────────────────────────────
+# Agents (LoongCollector instances) connect to this endpoint
+# for heartbeats and configuration delivery.
+agent_server:
+  host: "0.0.0.0"   # bind address; use "127.0.0.1" to restrict to localhost
+  port: 8080
+
+# ── Admin API / WebUI server ──────────────────────────────────
+# The embedded React WebUI and REST management API.
+admin_server:
+  host: "0.0.0.0"
+  port: 8081
+
+# ── Metrics ───────────────────────────────────────────────────
+metrics:
+  # Remote write endpoint for Prometheus text metrics.
+  # Supports Victoria Metrics agent push or Prometheus Pushgateway.
+  # Leave empty to disable remote push; /metrics is always available.
+  push_url: ""                 # e.g. "http://vmagent:8429/api/v1/import/prometheus"
+  push_interval: 30s           # How often to push metrics to push_url
+  online_window: 5m            # Agents with heartbeat older than this are counted as offline

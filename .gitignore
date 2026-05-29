@@ -1,0 +1,19 @@
+# Compiled binaries
+bin/
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+
+# Frontend build artifacts
+webui/node_modules/
+webui/dist/
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
