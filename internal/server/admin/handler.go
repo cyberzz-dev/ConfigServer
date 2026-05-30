@@ -37,9 +37,10 @@ type AdminHandler struct {
 // groupSnapshot is stored as history Detail when a group is deleted,
 // enabling full restoration via rollback.
 type groupSnapshot struct {
-	Description string                      `json:"description"`
-	Tags        []*model.AgentGroupTag      `json:"tags"`
-	Configs     []*model.GroupConfigMapping `json:"configs"`
+	Description    string                      `json:"description"`
+	IPSelectorJSON string                      `json:"ip_selector_json"`
+	Tags           []*model.AgentGroupTag      `json:"tags"`
+	Configs        []*model.GroupConfigMapping `json:"configs"`
 }
 
 // NewAdminHandler creates an AdminHandler backed by the given cache manager.
@@ -73,6 +74,9 @@ func RegisterAdminRoutes(mux *http.ServeMux, h *AdminHandler) {
 	// Group tags
 	mux.HandleFunc("GET /api/v1/groups/{name}/tags", h.GetGroupTags)
 	mux.HandleFunc("PUT /api/v1/groups/{name}/tags", h.SetGroupTags)
+	mux.HandleFunc("GET /api/v1/groups/{name}/ip-selector", h.GetGroupIPSelector)
+	mux.HandleFunc("PUT /api/v1/groups/{name}/ip-selector", h.SetGroupIPSelector)
+	mux.HandleFunc("DELETE /api/v1/groups/{name}/ip-selector", h.DeleteGroupIPSelector)
 
 	// Group ↔ config associations
 	mux.HandleFunc("GET /api/v1/groups/{name}/configs", h.GetGroupConfigs)
@@ -445,6 +449,14 @@ func (h *AdminHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, fmt.Sprintf("%q is a reserved built-in group", model.DefaultGroupName))
 		return
 	}
+	if g.IPSelectorJSON != "" {
+		selector, err := model.ParseIPSelectorJSON(g.IPSelectorJSON)
+		if err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+		g.IPSelectorJSON, _ = model.MarshalIPSelector(selector)
+	}
 	if err := h.mgr.CreateGroup(r.Context(), &g); err != nil {
 		internalError(w, err)
 		return
@@ -506,6 +518,7 @@ func (h *AdminHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 	var snap groupSnapshot
 	if g, err := h.mgr.GetGroup(r.Context(), name); err == nil {
 		snap.Description = g.Description
+		snap.IPSelectorJSON = g.IPSelectorJSON
 	}
 	snap.Tags, _ = h.mgr.GetGroupTags(r.Context(), name)
 	snap.Configs, _ = h.mgr.GetGroupConfigs(r.Context(), name)
@@ -521,6 +534,83 @@ func (h *AdminHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Group tag handlers ────────────────────────────────────────────────────────
+
+func (h *AdminHandler) GetGroupIPSelector(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	group, err := h.mgr.GetGroup(r.Context(), name)
+	if err != nil {
+		if isNotFound(err) {
+			notFound(w)
+			return
+		}
+		internalError(w, err)
+		return
+	}
+	selector, err := model.ParseIPSelectorJSON(group.IPSelectorJSON)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	ok(w, selector)
+}
+
+func (h *AdminHandler) SetGroupIPSelector(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var selector model.AgentGroupIPSelector
+	if err := readJSON(r, &selector); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	selectorJSON, err := model.MarshalIPSelector(selector)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	group, err := h.mgr.GetGroup(r.Context(), name)
+	if err != nil {
+		if isNotFound(err) {
+			notFound(w)
+			return
+		}
+		internalError(w, err)
+		return
+	}
+	oldJSON := []byte(group.IPSelectorJSON)
+	group.IPSelectorJSON = selectorJSON
+	if err := h.mgr.UpdateGroup(r.Context(), group); err != nil {
+		internalError(w, err)
+		return
+	}
+	summary := selectorJSON
+	if summary == "" {
+		summary = "(cleared)"
+	}
+	h.saveHistory(r.Context(), "group", name, "set_ip_selector", 0, oldJSON)
+	h.logAudit(r, http.StatusOK, "set_ip_selector", "group", name, summary)
+	ok(w, selector)
+}
+
+func (h *AdminHandler) DeleteGroupIPSelector(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	group, err := h.mgr.GetGroup(r.Context(), name)
+	if err != nil {
+		if isNotFound(err) {
+			notFound(w)
+			return
+		}
+		internalError(w, err)
+		return
+	}
+	oldJSON := []byte(group.IPSelectorJSON)
+	group.IPSelectorJSON = ""
+	if err := h.mgr.UpdateGroup(r.Context(), group); err != nil {
+		internalError(w, err)
+		return
+	}
+	h.saveHistory(r.Context(), "group", name, "set_ip_selector", 0, oldJSON)
+	h.logAudit(r, http.StatusOK, "set_ip_selector", "group", name, "(cleared)")
+	ok(w, model.AgentGroupIPSelector{IPs: []string{}})
+}
 
 func (h *AdminHandler) GetGroupTags(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
@@ -1311,6 +1401,28 @@ func (h *AdminHandler) RollbackConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	case "group":
 		switch entry.Action {
+		case "set_ip_selector":
+			group, err2 := h.mgr.GetGroup(r.Context(), name)
+			if err2 != nil {
+				if isNotFound(err2) {
+					notFound(w)
+					return
+				}
+				internalError(w, err2)
+				return
+			}
+			oldDetail = []byte(group.IPSelectorJSON)
+			if len(entry.Detail) > 0 {
+				if _, err2 := model.ParseIPSelectorJSON(string(entry.Detail)); err2 != nil {
+					badRequest(w, "cannot parse stored ip selector: "+err2.Error())
+					return
+				}
+			}
+			group.IPSelectorJSON = string(entry.Detail)
+			if err2 := h.mgr.UpdateGroup(r.Context(), group); err2 != nil {
+				internalError(w, err2)
+				return
+			}
 		case "set_tags":
 			// Restore old tags stored as JSON in history Detail.
 			var oldTags []*model.AgentGroupTag
@@ -1368,6 +1480,7 @@ func (h *AdminHandler) RollbackConfig(w http.ResponseWriter, r *http.Request) {
 			if existingGroup != nil {
 				// Override: update description, clear configs, then re-add from snapshot.
 				existingGroup.Description = snap.Description
+				existingGroup.IPSelectorJSON = snap.IPSelectorJSON
 				if err2 = h.mgr.UpdateGroup(r.Context(), existingGroup); err2 != nil {
 					internalError(w, err2)
 					return
@@ -1379,8 +1492,9 @@ func (h *AdminHandler) RollbackConfig(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				if err2 = h.mgr.CreateGroup(r.Context(), &model.AgentGroup{
-					Name:        name,
-					Description: snap.Description,
+					Name:           name,
+					Description:    snap.Description,
+					IPSelectorJSON: snap.IPSelectorJSON,
 				}); err2 != nil {
 					internalError(w, err2)
 					return

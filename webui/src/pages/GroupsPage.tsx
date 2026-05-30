@@ -9,6 +9,7 @@ import type { AgentGroup, GroupTag, GroupConfigMapping, Config, OnetimeCommand, 
 import {
   listGroups, createGroup, updateGroup, deleteGroup,
   getGroupTags, setGroupTags,
+  getGroupIPSelector, setGroupIPSelector, deleteGroupIPSelector,
   getGroupConfigs, addGroupConfig, removeGroupConfig,
   listPipelineConfigs, listInstanceConfigs, listOnetimeCommands,
   listConfigHistory, rollbackConfig, listDeletedConfigs,
@@ -52,15 +53,34 @@ function tagsToText(detail: string): string {
   }
 }
 
+function ipSelectorToText(detail: string): string {
+  try {
+    const selector = JSON.parse(detail) as { ips?: string[] }
+    return (selector.ips ?? []).join('\n')
+  } catch {
+    return detail.trim()
+  }
+}
+
+function parseIPSelectorLines(detail?: string): string[] {
+  if (!detail) return []
+  return ipSelectorToText(detail).split('\n').map(line => line.trim()).filter(Boolean)
+}
+
 function deleteSnapshotToText(detail: string): string {
   try {
     const snap = JSON.parse(detail) as {
       description?: string
+      ip_selector_json?: string
       tags?: { TagName: string; TagValue: string }[]
       configs?: { ConfigType: string; ConfigName: string }[]
     }
     const lines: string[] = []
     if (snap.description) lines.push(`description: ${snap.description}`)
+    if (snap.ip_selector_json) {
+      lines.push('[ip selector]')
+      ipSelectorToText(snap.ip_selector_json).split('\n').filter(Boolean).forEach(ip => lines.push(`  ${ip}`))
+    }
     if (snap.tags?.length) {
       lines.push('[tags]')
       snap.tags.forEach(t => lines.push(`  ${t.TagName}=${t.TagValue}`))
@@ -82,6 +102,8 @@ export default function GroupsPage() {
   const [editTarget, setEditTarget] = useState<AgentGroup | null>(null)
   const [tagsGroup, setTagsGroup] = useState<AgentGroup | null>(null)
   const [tags, setTags] = useState<GroupTag[]>([])
+  const [ipSelectorGroup, setIPSelectorGroup] = useState<AgentGroup | null>(null)
+  const [ipSelectorLines, setIPSelectorLines] = useState<string[]>([])
   const [configsGroup, setConfigsGroup] = useState<AgentGroup | null>(null)
   const [configs, setConfigs] = useState<GroupConfigMapping[]>([])
   const [addConfigOpen, setAddConfigOpen] = useState(false)
@@ -106,22 +128,32 @@ export default function GroupsPage() {
   const [recycleConfirmItem, setRecycleConfirmItem] = useState<ConfigHistory | null>(null)
   const [recycleDiffCurrent, setRecycleDiffCurrent] = useState('')
   const [recycleDiffLoading, setRecycleDiffLoading] = useState(false)
-  const [groupMeta, setGroupMeta] = useState<Record<string, { tagCount: number; configCount: number }>>({})
+  const [groupMeta, setGroupMeta] = useState<Record<string, { tagCount?: number; ipSelectorCount?: number; configCount?: number }>>({})
   const [form] = Form.useForm()
   const [tagsForm] = Form.useForm()
+  const [ipSelectorForm] = Form.useForm()
   const canCreate = usePermission('agent_groups', 'create')
   const canUpdate = usePermission('agent_groups', 'update')
   const canDelete = usePermission('agent_groups', 'delete')
 
   const refreshMeta = async (grps: AgentGroup[]) => {
-    const results = await Promise.allSettled(
+    const results = await Promise.all(
       grps.map(async g => {
-        const [tags, cfgs] = await Promise.all([getGroupTags(g.Name), getGroupConfigs(g.Name)])
-        return { name: g.Name, tagCount: tags.length, configCount: cfgs.length }
+        const [tagsResult, ipSelectorResult, configsResult] = await Promise.allSettled([
+          getGroupTags(g.Name),
+          getGroupIPSelector(g.Name),
+          getGroupConfigs(g.Name),
+        ])
+        return {
+          name: g.Name,
+          tagCount: tagsResult.status === 'fulfilled' ? tagsResult.value.length : 0,
+          ipSelectorCount: ipSelectorResult.status === 'fulfilled' ? ipSelectorResult.value.ips.length : parseIPSelectorLines(g.IPSelectorJSON).length,
+          configCount: configsResult.status === 'fulfilled' ? configsResult.value.length : 0,
+        }
       })
     )
-    const meta: Record<string, { tagCount: number; configCount: number }> = {}
-    results.forEach(r => { if (r.status === 'fulfilled') meta[r.value.name] = r.value })
+    const meta: Record<string, { tagCount?: number; ipSelectorCount?: number; configCount?: number }> = {}
+    results.forEach(r => { meta[r.name] = r })
     setGroupMeta(meta)
   }
 
@@ -194,10 +226,15 @@ export default function GroupsPage() {
       // Fetch current group state
       const currentGroup = groups.find(g => g.Name === item.resource_name)
       const currentTags = await getGroupTags(item.resource_name)
+      const currentIPSelector = await getGroupIPSelector(item.resource_name)
       const currentConfigs = await getGroupConfigs(item.resource_name)
       
       const lines: string[] = []
       if (currentGroup?.Description) lines.push(`description: ${currentGroup.Description}`)
+      if (currentIPSelector.ips.length) {
+        lines.push('[ip selector]')
+        currentIPSelector.ips.forEach(ip => lines.push(`  ${ip}`))
+      }
       if (currentTags.length) {
         lines.push('[tags]')
         currentTags.forEach(t => lines.push(`  ${t.TagName}=${t.TagValue}`))
@@ -226,6 +263,9 @@ export default function GroupsPage() {
       if (item.action === 'set_tags') {
         const current = await getGroupTags(historyTarget!)
         setDiffCurrentStr(current.map((t: GroupTag) => `${t.TagName}=${t.TagValue}`).join('\n'))
+      } else if (item.action === 'set_ip_selector') {
+        const current = await getGroupIPSelector(historyTarget!)
+        setDiffCurrentStr(current.ips.join('\n'))
       } else {
         // add_config / remove_config — fetch current config list
         const current = await getGroupConfigs(historyTarget!)
@@ -258,6 +298,37 @@ export default function GroupsPage() {
     setTags(t)
     setTagsGroup(g)
     tagsForm.setFieldsValue({ tags: t.map(x => `${x.TagName}=${x.TagValue}`).join('\n') })
+  }
+
+  const openIPSelector = async (g: AgentGroup) => {
+    let ips = parseIPSelectorLines(g.IPSelectorJSON)
+    try {
+      const selector = await getGroupIPSelector(g.Name)
+      ips = selector.ips
+    } catch (e) {
+      message.warning('Failed to load IP selector from API; showing cached group data')
+    }
+    setIPSelectorLines(ips)
+    setIPSelectorGroup(g)
+    ipSelectorForm.setFieldsValue({ ips: ips.join('\n') })
+  }
+
+  const handleSaveIPSelector = async () => {
+    const { ips: raw } = await ipSelectorForm.validateFields()
+    const ips = (raw as string).split('\n').map(line => line.trim()).filter(Boolean)
+    await setGroupIPSelector(ipSelectorGroup!.Name, { ips })
+    message.success('IP selector saved')
+    const name = ipSelectorGroup!.Name
+    setIPSelectorGroup(null)
+    setGroupMeta(prev => ({ ...prev, [name]: { ...prev[name], ipSelectorCount: ips.length } }))
+  }
+
+  const handleClearIPSelector = async () => {
+    await deleteGroupIPSelector(ipSelectorGroup!.Name)
+    message.success('IP selector cleared')
+    const name = ipSelectorGroup!.Name
+    setIPSelectorGroup(null)
+    setGroupMeta(prev => ({ ...prev, [name]: { ...prev[name], ipSelectorCount: 0 } }))
   }
 
   const handleSaveTags = async () => {
@@ -338,7 +409,7 @@ export default function GroupsPage() {
       sorter: (a: AgentGroup, b: AgentGroup) => (a.UpdatedAt ?? '').localeCompare(b.UpdatedAt ?? ''),
       render: (v: string) => v ? dayjs(v).format('YYYY-MM-DD HH:mm:ss') : '—' },
     {
-      title: 'Actions', key: 'actions', width: 260,
+      title: 'Actions', key: 'actions', width: 330,
       render: (_: unknown, record: AgentGroup) => (
         <Space size={4} onClick={e => e.stopPropagation()}>
           {canUpdate && <Button size="small" onClick={() => { setSelectedRow(record.Name); setEditTarget(record); form.setFieldsValue({ description: record.Description }) }}>Edit</Button>}
@@ -347,6 +418,12 @@ export default function GroupsPage() {
               ? { borderColor: '#52c41a', color: '#52c41a' }
               : { color: '#bfbfbf', borderColor: '#d9d9d9' }}>
             {`Tags (${String(groupMeta[record.Name]?.tagCount ?? '\u2026').padEnd(2, '\u00A0')})`}
+          </Button>
+          <Button size="small" onClick={() => openIPSelector(record)}
+            style={groupMeta[record.Name]?.ipSelectorCount
+              ? { borderColor: '#13c2c2', color: '#13c2c2' }
+              : { color: '#bfbfbf', borderColor: '#d9d9d9' }}>
+            {`IPs (${String(groupMeta[record.Name]?.ipSelectorCount ?? '\u2026').padEnd(2, '\u00A0')})`}
           </Button>
           <Button size="small" onClick={() => openConfigs(record)}
             style={groupMeta[record.Name]?.configCount
@@ -420,6 +497,31 @@ export default function GroupsPage() {
         </Form>
         <div>
           {tags.map(t => <Tag key={`${t.TagName}=${t.TagValue}`}>{t.TagName}={t.TagValue}</Tag>)}
+        </div>
+      </Modal>
+
+      {/* IP selector modal */}
+      <Modal
+        title={`IP Selector for "${ipSelectorGroup?.Name}"`}
+        open={!!ipSelectorGroup}
+        onOk={handleSaveIPSelector}
+        onCancel={() => setIPSelectorGroup(null)}
+        footer={[
+          <Button key="clear" danger onClick={handleClearIPSelector} disabled={!ipSelectorLines.length}>Clear</Button>,
+          <Button key="cancel" onClick={() => setIPSelectorGroup(null)}>Cancel</Button>,
+          <Button key="save" type="primary" onClick={handleSaveIPSelector}>Save</Button>,
+        ]}
+      >
+        <p style={{ marginTop: 0 }}>
+          One rule per line, for example: <code>192.168.1.2</code>, <code>192.168.1.200-230</code>, <code>192.168.1.0/24</code>
+        </p>
+        <Form form={ipSelectorForm} layout="vertical">
+          <Form.Item name="ips">
+            <LineNumberedEditor rows={8} />
+          </Form.Item>
+        </Form>
+        <div>
+          {ipSelectorLines.map(ip => <Tag key={ip}>{ip}</Tag>)}
         </div>
       </Modal>
 
@@ -525,11 +627,12 @@ export default function GroupsPage() {
           dataSource={historyList}
           locale={{ emptyText: 'No history yet' }}
           renderItem={item => {
-            const canRollback = item.action === 'set_tags' || item.action === 'add_config' || item.action === 'remove_config' || item.action === 'delete'
+            const canRollback = item.action === 'set_tags' || item.action === 'set_ip_selector' || item.action === 'add_config' || item.action === 'remove_config' || item.action === 'delete'
             const tagColor = item.action === 'delete' ? 'red'
               : item.action === 'create' ? 'green'
               : item.action === 'rollback' ? 'purple'
               : item.action === 'set_tags' ? 'geekblue'
+              : item.action === 'set_ip_selector' ? 'teal'
               : item.action === 'add_config' ? 'cyan'
               : item.action === 'remove_config' ? 'orange'
               : 'blue'
@@ -549,7 +652,7 @@ export default function GroupsPage() {
         />
       </Drawer>
 
-      {/* Diff/rollback modal — set_tags / add_config / remove_config / delete */}
+      {/* Diff/rollback modal — set_tags / set_ip_selector / add_config / remove_config / delete */}
       {diffEntry && (() => {
         // Build before/after strings depending on action
         let beforeStr: string
@@ -558,6 +661,10 @@ export default function GroupsPage() {
         if (diffEntry.action === 'set_tags') {
           beforeStr = diffCurrentStr
           afterStr = tagsToText(diffEntry.detail)
+          diffLines = computeDiff(beforeStr, afterStr)
+        } else if (diffEntry.action === 'set_ip_selector') {
+          beforeStr = diffCurrentStr
+          afterStr = ipSelectorToText(diffEntry.detail)
           diffLines = computeDiff(beforeStr, afterStr)
         } else if (diffEntry.action === 'add_config') {
           // rollback = remove this config
@@ -579,6 +686,8 @@ export default function GroupsPage() {
         const hasChanges = !diffLoading && (diffEntry.action === 'delete' ? diffLines.length > 0 : diffLines.some(l => l.type !== 'equal'))
         const modalTitle = diffEntry.action === 'set_tags'
           ? 'Rollback Preview — Tags'
+          : diffEntry.action === 'set_ip_selector'
+            ? 'Rollback Preview — IP Selector'
           : diffEntry.action === 'add_config'
             ? `Rollback Preview — Remove config "${diffEntry.detail}"`
             : diffEntry.action === 'remove_config'

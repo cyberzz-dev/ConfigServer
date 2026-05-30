@@ -13,12 +13,14 @@ const STATUS_LABEL: Record<number, string> = {
   1: 'APPLYING',
   2: 'APPLIED',
   3: 'FAILED',
+  4: 'DELETED',
 }
 
 const STATUS_CLASS: Record<number, string> = {
   1: 'status-applying',
   2: 'status-applied',
   3: 'status-failed',
+  4: 'status-deleted',
 }
 
 const TYPE_COLORS: Record<string, string> = {

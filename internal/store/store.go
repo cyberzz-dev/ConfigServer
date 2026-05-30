@@ -73,15 +73,15 @@ type Store interface {
 	UpsertAgentConfigStatus(ctx context.Context, status *model.AgentConfigStatus) error
 	GetAgentConfigStatuses(ctx context.Context, instanceID string) ([]*model.AgentConfigStatus, error)
 
-	// ── Core: tag-based config resolution ────────────────────────────────
+	// ── Core: agent-based config resolution ──────────────────────────────
 	//
 	// GetConfigsForAgent returns all pipeline, instance and onetime configs that
-	// should be delivered to an agent with the given tags.
+	// should be delivered to an agent with the given match context.
 	//
-	// Matching semantics: a group matches when ANY of the group's defined tags
-	// appear in agentTags (union / "any-must-match").  The result is the
-	// deduplicated union of configs from every matched group.
-	GetConfigsForAgent(ctx context.Context, agentTags []model.AgentGroupTag) ([]*model.PipelineConfig, []*model.InstanceConfig, []*model.OnetimeCommand, error)
+	// Matching semantics: default group OR any matching tag OR any matching IP
+	// selector. The result is the deduplicated union of configs from every
+	// matched group.
+	GetConfigsForAgent(ctx context.Context, match model.AgentMatchContext) ([]*model.PipelineConfig, []*model.InstanceConfig, []*model.OnetimeCommand, error)
 
 	// ── User management ───────────────────────────────────────────────────
 
