@@ -1,8 +1,8 @@
-import { useEffect, useState, useMemo } from 'react'
-import { Table, Button, Modal, Form, Input, Space, message, DatePicker, Tag, Popover, Drawer, List, Typography, Alert } from 'antd'
+import { useEffect, useState, useMemo, type CSSProperties } from 'react'
+import { Table, Button, Modal, Form, Input, Space, message, DatePicker, Tag, Drawer, List, Typography, Alert, Segmented } from 'antd'
 import DeleteConfirmModal from '../components/DeleteConfirmModal'
 import LineNumberedEditor from '../components/LineNumberedEditor'
-import { PlusOutlined, HistoryOutlined, RollbackOutlined } from '@ant-design/icons'
+import { CopyOutlined, EyeOutlined, PlusOutlined, HistoryOutlined, RollbackOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import * as yaml from 'js-yaml'
 import type { Config, OnetimeCommand, ConfigHistory } from '../api'
@@ -73,6 +73,81 @@ function formatForDiff(detail: string): string {
   } catch {
     return detail.trimEnd()
   }
+}
+
+function formatDetail(v: string) {
+  try { return JSON.stringify(JSON.parse(v), null, 2) } catch { return v }
+}
+
+function toYaml(input: string): string {
+  let parsed: unknown
+  try { parsed = JSON.parse(input.trim()) }
+  catch { parsed = yaml.load(input.trim()) }
+  if (parsed == null) throw new Error('Content is empty')
+  return yaml.dump(parsed, { indent: 2, lineWidth: -1 })
+}
+
+async function copyText(text: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.style.position = 'fixed'
+      textarea.style.left = '-9999px'
+      document.body.appendChild(textarea)
+      textarea.focus()
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
+    message.success('Copied')
+  } catch (e) {
+    message.error('Copy failed: ' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+function parseExpireDuration(input?: string): number {
+  const trimmed = input?.trim()
+  if (!trimmed) return 0
+  const match = trimmed.match(/^(\d+)\s*(min|h|d|w|m)$/i)
+  if (!match) throw new Error('Use duration like 60min, 6h, 6d, 6w, or 6m')
+  const amount = Number(match[1])
+  if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('Duration must be a positive integer')
+  const unit = match[2].toLowerCase()
+  switch (unit) {
+    case 'min': return dayjs().add(amount, 'minute').unix()
+    case 'h': return dayjs().add(amount, 'hour').unix()
+    case 'd': return dayjs().add(amount, 'day').unix()
+    case 'w': return dayjs().add(amount, 'week').unix()
+    case 'm': return dayjs().add(amount, 'month').unix()
+    default: throw new Error('Unsupported duration unit')
+  }
+}
+
+function ReadonlyPayloadViewer({ value, style }: { value: string; style?: CSSProperties }) {
+  const lines = (value || '(empty payload)').split('\n')
+  const lineNoWidth = Math.max(String(lines.length).length * 9, 24) + 18
+  return (
+    <div style={{
+      maxHeight: '60vh', overflow: 'auto', margin: 0, fontSize: 12,
+      background: '#fff', border: '1px solid #d9d9d9', borderRadius: 6,
+      color: '#1f1f1f', fontFamily: 'monospace', lineHeight: '20px',
+      ...style,
+    }}>
+      {lines.map((line, index) => (
+        <div key={index} style={{ display: 'flex', minWidth: 'max-content' }}>
+          <span style={{
+            width: lineNoWidth, flexShrink: 0, boxSizing: 'border-box',
+            padding: '0 8px 0 6px', textAlign: 'right', userSelect: 'none',
+            color: '#8c8c8c', background: '#fafafa', borderRight: '1px solid #f0f0f0',
+          }}>{index + 1}</span>
+          <span style={{ whiteSpace: 'pre', padding: '0 8px' }}>{line || ' '}</span>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function DiffModal({
@@ -202,6 +277,8 @@ function PipelinePanel() {
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState<Config | null>(null)
   const [detail, setDetail] = useState('')
+  const [viewTarget, setViewTarget] = useState<Config | null>(null)
+  const [viewDetail, setViewDetail] = useState('')
   const [selectedRow, setSelectedRow] = useState<string | undefined>()
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [historyTarget, setHistoryTarget] = useState<string | null>(null)
@@ -234,6 +311,11 @@ function PipelinePanel() {
     setDetail(formatted)
     form.setFieldsValue({ name: cfg.name }); setOpen(true)
   }
+  const openView = (cfg: Config) => {
+    setSelectedRow(cfg.name)
+    setViewTarget(cfg)
+    setViewDetail(formatDetail(cfg.detail))
+  }
   const openHistory = async (name: string) => {
     setHistoryTarget(name)
     setHistoryLoading(true)
@@ -247,6 +329,7 @@ function PipelinePanel() {
     finally { setRecycleLoading(false) }
   }
   const fmt = useMemo(() => detectFormat(detail), [detail])
+  const viewFmt = useMemo(() => detectFormat(viewDetail), [viewDetail])
 
   const handleToYaml = () => {
     try {
@@ -259,6 +342,14 @@ function PipelinePanel() {
   }
   const handleToJson = () => {
     try { setDetail(toJSON(detail)) }
+    catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
+  }
+  const handleViewToYaml = () => {
+    try { setViewDetail(toYaml(viewDetail)) }
+    catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
+  }
+  const handleViewToJson = () => {
+    try { setViewDetail(toJSON(viewDetail)) }
     catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
   }
 
@@ -292,9 +383,10 @@ function PipelinePanel() {
       sorter: (a: Config, b: Config) => a.updated_at.localeCompare(b.updated_at),
       render: (v: string) => dayjs(v).format('YYYY-MM-DD HH:mm:ss') },
     {
-      title: 'Actions', key: 'act', width: 180,
+      title: 'Actions', key: 'act', width: 250,
       render: (_: unknown, r: Config) => (
         <Space size={4} onClick={e => e.stopPropagation()}>
+          <Button size="small" icon={<EyeOutlined />} onClick={() => openView(r)}>View</Button>
           {canUpdate && <Button size="small" onClick={() => openEdit(r)}>Edit</Button>}
           {canDelete && (
             <Button size="small" danger onClick={() => { setSelectedRow(r.name); setDeleteTarget(r.name) }}>Delete</Button>
@@ -357,6 +449,32 @@ function PipelinePanel() {
         onConfirm={() => del(deleteTarget!)}
         onCancel={() => setDeleteTarget(null)}
       />
+      <Modal
+        title={`Pipeline Config — ${viewTarget?.name ?? ''}`}
+        open={viewTarget !== null}
+        onCancel={() => setViewTarget(null)}
+        width="90vw"
+        style={{ maxWidth: 1200 }}
+        footer={[
+          <Button key="copy" icon={<CopyOutlined />} onClick={() => copyText(viewDetail)}>COPY</Button>,
+          <Button key="close" type="primary" onClick={() => setViewTarget(null)}>Close</Button>,
+        ]}
+      >
+        {viewTarget && (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Space wrap>
+              <Tag color="blue">{viewTarget.name}</Tag>
+              <Tag>v{viewTarget.version}</Tag>
+              <Tag color={viewFmt === 'yaml' ? 'blue' : viewFmt === 'json' ? 'green' : 'red'}>
+                {viewFmt === 'yaml' ? 'YAML' : viewFmt === 'json' ? 'JSON' : 'Invalid format'}
+              </Tag>
+              <Button size="small" onClick={handleViewToYaml} disabled={viewFmt !== 'json'}>JSON to YAML</Button>
+              <Button size="small" onClick={handleViewToJson} disabled={viewFmt !== 'yaml'}>YAML to JSON</Button>
+            </Space>
+            <ReadonlyPayloadViewer value={viewDetail} />
+          </Space>
+        )}
+      </Modal>
       <Drawer
         title={`History — Pipeline Config "${historyTarget}"`}
         open={historyTarget !== null}
@@ -683,6 +801,8 @@ function OnetimePanel() {
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
   const [detail, setDetail] = useState('')
+  const [viewTarget, setViewTarget] = useState<OnetimeCommand | null>(null)
+  const [viewDetail, setViewDetail] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [selectedRow, setSelectedRow] = useState<string | undefined>()
   const [historyTarget, setHistoryTarget] = useState<string | null>(null)
@@ -694,6 +814,7 @@ function OnetimePanel() {
   const [recycleList, setRecycleList] = useState<ConfigHistory[]>([])
   const [recycleLoading, setRecycleLoading] = useState(false)
   const [form] = Form.useForm()
+  const expireMode = Form.useWatch('expire_mode', form) ?? 'absolute'
   const canCreate = usePermission('onetime_commands', 'create')
   const canDelete = usePermission('onetime_commands', 'delete')
 
@@ -704,6 +825,13 @@ function OnetimePanel() {
   useEffect(() => { refresh() }, [])
 
   const fmt = useMemo(() => detectFormat(detail), [detail])
+  const viewFmt = useMemo(() => detectFormat(viewDetail), [viewDetail])
+
+  const openView = (cmd: OnetimeCommand) => {
+    setSelectedRow(cmd.name)
+    setViewTarget(cmd)
+    setViewDetail(formatDetail(cmd.detail))
+  }
 
   const openHistory = async (name: string) => {
     setHistoryTarget(name)
@@ -727,7 +855,15 @@ function OnetimePanel() {
       message.error('Invalid format: ' + (e instanceof Error ? e.message : String(e)))
       return
     }
-    const expireTs = vals.expire_time ? (vals.expire_time as dayjs.Dayjs).unix() : 0
+    let expireTs = 0
+    try {
+      expireTs = vals.expire_mode === 'duration'
+        ? parseExpireDuration(vals.expire_duration)
+        : vals.expire_time ? (vals.expire_time as dayjs.Dayjs).unix() : 0
+    } catch (e) {
+      message.error('Invalid expire duration: ' + (e instanceof Error ? e.message : String(e)))
+      return
+    }
     await createOnetimeCommand(vals.name, jsonDetail, expireTs)
     message.success(`Onetime Command "${vals.name}" created`)
     setOpen(false)
@@ -743,8 +879,13 @@ function OnetimePanel() {
     refresh()
   }
 
-  const formatDetail = (v: string) => {
-    try { return JSON.stringify(JSON.parse(v), null, 2) } catch { return v }
+  const handleViewToYaml = () => {
+    try { setViewDetail(toYaml(viewDetail)) }
+    catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
+  }
+  const handleViewToJson = () => {
+    try { setViewDetail(toJSON(viewDetail)) }
+    catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
   }
 
   const now = Date.now() / 1000
@@ -766,22 +907,12 @@ function OnetimePanel() {
         if (!v) return <span style={{ color: '#999' }}>-</span>
         const preview = v.length > 80 ? v.slice(0, 80) + '…' : v
         return (
-          <Popover
-            title="Detail (command payload)"
-            content={
-              <pre style={{ maxWidth: 560, maxHeight: 400, overflow: 'auto', margin: 0, fontSize: 12 }}>
-                {formatDetail(v)}
-              </pre>
-            }
-            trigger="hover"
-          >
-            <code style={{
-              cursor: 'default', fontSize: 11, color: '#1677ff',
-              background: 'rgba(22,119,255,0.08)',
-              padding: '2px 6px', borderRadius: 3,
-              fontFamily: 'monospace', whiteSpace: 'nowrap',
-            }}>{preview}</code>
-          </Popover>
+          <code style={{
+            cursor: 'default', fontSize: 11, color: '#1677ff',
+            background: 'rgba(22,119,255,0.08)',
+            padding: '2px 6px', borderRadius: 3,
+            fontFamily: 'monospace', whiteSpace: 'nowrap',
+          }}>{preview}</code>
         )
       },
     },
@@ -793,7 +924,7 @@ function OnetimePanel() {
         const expired = v < now
         return (
           <Tag color={expired ? 'red' : 'green'}>
-            {dayjs.unix(v).format('YYYY-MM-DD HH:mm')}
+            {dayjs.unix(v).format('YYYY-MM-DD HH:mm:ss')}
             {expired ? ' (expired)' : ''}
           </Tag>
         )
@@ -803,9 +934,10 @@ function OnetimePanel() {
       sorter: (a: OnetimeCommand, b: OnetimeCommand) => a.created_at.localeCompare(b.created_at),
       render: (v: string) => dayjs(v).format('YYYY-MM-DD HH:mm:ss') },
     {
-      title: 'Actions', key: 'act', width: 140,
+      title: 'Actions', key: 'act', width: 220,
       render: (_: unknown, r: OnetimeCommand) => (
         <Space size={4} onClick={e => e.stopPropagation()}>
+          <Button size="small" icon={<EyeOutlined />} onClick={() => openView(r)}>View</Button>
           {canDelete && (
             <Button size="small" danger onClick={() => { setSelectedRow(r.name); setDeleteTarget(r.name) }}>Delete</Button>
           )}
@@ -842,12 +974,35 @@ function OnetimePanel() {
       <Modal title="Create Onetime Command" open={open}
         onOk={save} onCancel={() => { setOpen(false); form.resetFields(); setDetail('') }}
         width="90vw" style={{ maxWidth: 900 }}>
-        <Form form={form} layout="vertical">
+        <Form form={form} layout="vertical" initialValues={{ expire_mode: 'absolute' }}>
           <Form.Item name="name" label="Name" rules={[{ required: true }]}>
             <Input placeholder="command-name" />
           </Form.Item>
-          <Form.Item name="expire_time" label="Expire Time (optional)">
-            <DatePicker showTime format="YYYY-MM-DD HH:mm:ss" style={{ width: '100%' }} />
+          <Form.Item label="Expire Time (optional)">
+            <Space direction="vertical" style={{ width: '100%' }} size={8}>
+              <Form.Item name="expire_mode" noStyle>
+                <Segmented
+                  options={[
+                    { label: 'Date Time', value: 'absolute' },
+                    { label: 'Duration', value: 'duration' },
+                  ]}
+                />
+              </Form.Item>
+              {expireMode === 'duration' ? (
+                <Space.Compact style={{ width: '100%' }}>
+                  <Form.Item name="expire_duration" noStyle>
+                    <Input placeholder="60min / 6h / 6d / 6w / 6m" />
+                  </Form.Item>
+                  {['60min', '6h', '6d', '6w', '6m'].map(v => (
+                    <Button key={v} onClick={() => form.setFieldValue('expire_duration', v)}>{v}</Button>
+                  ))}
+                </Space.Compact>
+              ) : (
+                <Form.Item name="expire_time" noStyle>
+                  <DatePicker showTime format="YYYY-MM-DD HH:mm:ss" style={{ width: '100%' }} />
+                </Form.Item>
+              )}
+            </Space>
           </Form.Item>
           <Form.Item
             label={
@@ -872,6 +1027,36 @@ function OnetimePanel() {
         onConfirm={() => del(deleteTarget!)}
         onCancel={() => setDeleteTarget(null)}
       />
+      <Modal
+        title={`Onetime Command — ${viewTarget?.name ?? ''}`}
+        open={viewTarget !== null}
+        onCancel={() => setViewTarget(null)}
+        width="80vw"
+        style={{ maxWidth: 900 }}
+        footer={[
+          <Button key="copy" icon={<CopyOutlined />} onClick={() => copyText(viewDetail)}>COPY</Button>,
+          <Button key="close" type="primary" onClick={() => setViewTarget(null)}>Close</Button>,
+        ]}
+      >
+        {viewTarget && (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Space wrap>
+              <Tag color="blue">{viewTarget.name}</Tag>
+              {viewTarget.expire_time ? (
+                <Tag color={viewTarget.expire_time < now ? 'red' : 'green'}>
+                  Expires {dayjs.unix(viewTarget.expire_time).format('YYYY-MM-DD HH:mm:ss')}
+                </Tag>
+              ) : <Tag>Never expires</Tag>}
+              <Tag color={viewFmt === 'yaml' ? 'blue' : viewFmt === 'json' ? 'green' : 'red'}>
+                {viewFmt === 'yaml' ? 'YAML' : viewFmt === 'json' ? 'JSON' : 'Invalid format'}
+              </Tag>
+              <Button size="small" onClick={handleViewToYaml} disabled={viewFmt !== 'json'}>JSON to YAML</Button>
+              <Button size="small" onClick={handleViewToJson} disabled={viewFmt !== 'yaml'}>YAML to JSON</Button>
+            </Space>
+            <ReadonlyPayloadViewer value={viewDetail} />
+          </Space>
+        )}
+      </Modal>
       <Drawer
         title={`History — Onetime Command "${historyTarget}"`}
         open={historyTarget !== null}
@@ -929,7 +1114,7 @@ function OnetimePanel() {
                   description={
                     <Typography.Text type="secondary">
                       Deleted {dayjs(item.changed_at).format('YYYY-MM-DD HH:mm:ss')} by {item.changed_by}
-                      {snapExpire ? ` · expires ${dayjs.unix(snapExpire).format('YYYY-MM-DD HH:mm')}` : ''}
+                      {snapExpire ? ` · expires ${dayjs.unix(snapExpire).format('YYYY-MM-DD HH:mm:ss')}` : ''}
                       {snapDetail ? <><br /><code style={{ fontSize: 11 }}>{snapDetail.length > 60 ? snapDetail.slice(0, 60) + '…' : snapDetail}</code></> : null}
                     </Typography.Text>
                   }
@@ -977,7 +1162,7 @@ function OnetimePanel() {
             )}
             <Typography.Text type="secondary">
               Deleted {dayjs(restoreEntry.changed_at).format('YYYY-MM-DD HH:mm:ss')} by {restoreEntry.changed_by}
-              {snapExpire ? ` · expires ${dayjs.unix(snapExpire).format('YYYY-MM-DD HH:mm')}` : ''}
+              {snapExpire ? ` · expires ${dayjs.unix(snapExpire).format('YYYY-MM-DD HH:mm:ss')}` : ''}
             </Typography.Text>
             <pre style={{ marginTop: 8, fontFamily: 'monospace', fontSize: 12, maxHeight: 300, overflow: 'auto', background: '#202124', border: '1px solid #3c4043', borderRadius: 6, padding: 10, color: '#e8eaed' }}>
               {snapDetail || '(empty payload)'}

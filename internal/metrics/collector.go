@@ -9,12 +9,10 @@
 // Package metrics exposes aggregated agent statistics in Prometheus text format.
 //
 // High-cardinality design:
-//   - NO per-agent label series (instance_id, hostname, IP) — these would create
-//     one time-series per agent and cause cardinality explosion in the TSDB.
-//   - Only bounded-label dimensions are used: running_status (~5 values),
-//     agent_type (~10 values).  Version is intentionally excluded as the label
-//     value space is unbounded; callers that need per-version counts should build
-//     a separate recording rule from the agent list API.
+//   - Aggregated configserver_* metrics use only bounded-label dimensions.
+//   - agent_hearbeat and agent_config intentionally expose per-agent series for
+//     external fleet inspection. Keep these disabled at the Prometheus scrape
+//     layer if the deployment cannot tolerate per-agent cardinality.
 //
 // Scrape: /metrics on the admin server (no auth, served alongside the WebUI).
 // Push:   start Collector.StartPush to periodically POST to a remote endpoint
@@ -29,6 +27,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +37,7 @@ import (
 // AgentLister is satisfied by *cache.Manager.
 type AgentLister interface {
 	ListAgents(ctx context.Context) ([]*model.Agent, error)
+	ListAgentConfigStatuses(ctx context.Context) ([]*model.AgentConfigStatus, error)
 }
 
 // Collector gathers aggregated agent metrics.
@@ -62,6 +62,10 @@ func (c *Collector) Collect(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("list agents: %w", err)
 	}
+	statuses, err := c.agents.ListAgentConfigStatuses(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list agent config statuses: %w", err)
+	}
 
 	now := time.Now()
 	var total, online int
@@ -69,8 +73,13 @@ func (c *Collector) Collect(ctx context.Context) (string, error) {
 	// Bounded-cardinality dimensions.
 	statusCounts := map[string]int{}
 	typeCounts := map[string]int{}
+	agentsByID := make(map[string]*model.Agent, len(agents))
 
 	for _, a := range agents {
+		if a == nil {
+			continue
+		}
+		agentsByID[a.InstanceID] = a
 		total++
 		if now.Sub(a.LastHeartbeat) <= c.onlineWindow {
 			online++
@@ -108,6 +117,49 @@ func (c *Collector) Collect(ctx context.Context) (string, error) {
 	sb.WriteString("# TYPE configserver_agents_by_type gauge\n")
 	for _, typ := range sortedKeys(typeCounts) {
 		fmt.Fprintf(&sb, "configserver_agents_by_type{agent_type=%q} %d\n", typ, typeCounts[typ])
+	}
+
+	sb.WriteString("# HELP agent_hearbeat Agent heartbeat status by agent labels. Value is running status (running/online/ok=1, other=0 when non-numeric) and timestamp is LastHeartbeat.\n")
+	sb.WriteString("# TYPE agent_hearbeat gauge\n")
+	for _, a := range agents {
+		if a == nil || a.LastHeartbeat.IsZero() {
+			continue
+		}
+		fmt.Fprintf(&sb,
+			"agent_hearbeat{%s} %g %d\n",
+			formatLabels([]labelPair{
+				{name: "type", value: a.AgentType},
+				{name: "uuid", value: a.InstanceID},
+				{name: "ip", value: a.IP},
+				{name: "hostname", value: a.Hostname},
+				{name: "version", value: a.Version},
+			}),
+			runningStatusValue(a.RunningStatus),
+			unixMilli(a.LastHeartbeat),
+		)
+	}
+
+	sb.WriteString("# HELP agent_config Agent config apply status by config and agent labels. Value is config status and timestamp is UpdatedAt.\n")
+	sb.WriteString("# TYPE agent_config gauge\n")
+	for _, s := range statuses {
+		if s == nil || s.UpdatedAt.IsZero() {
+			continue
+		}
+		agent := agentsByID[s.InstanceID]
+		fmt.Fprintf(&sb,
+			"agent_config{%s} %d %d\n",
+			formatLabels([]labelPair{
+				{name: "config_name", value: s.ConfigName},
+				{name: "config_type", value: s.ConfigType},
+				{name: "agent_type", value: agentLabelValue(agent, func(a *model.Agent) string { return a.AgentType })},
+				{name: "agent_uuid", value: s.InstanceID},
+				{name: "agent_ip", value: agentLabelValue(agent, func(a *model.Agent) string { return a.IP })},
+				{name: "agent_hostname", value: agentLabelValue(agent, func(a *model.Agent) string { return a.Hostname })},
+				{name: "agent_version", value: agentLabelValue(agent, func(a *model.Agent) string { return a.Version })},
+			}),
+			s.Status,
+			unixMilli(s.UpdatedAt),
+		)
 	}
 
 	return sb.String(), nil
@@ -196,4 +248,43 @@ func sortedKeys(m map[string]int) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+type labelPair struct {
+	name  string
+	value string
+}
+
+func formatLabels(labels []labelPair) string {
+	pairs := make([]string, 0, len(labels))
+	for _, label := range labels {
+		pairs = append(pairs, fmt.Sprintf("%s=%q", label.name, label.value))
+	}
+	return strings.Join(pairs, ",")
+}
+
+func unixMilli(t time.Time) int64 {
+	return t.UnixNano() / int64(time.Millisecond)
+}
+
+func runningStatusValue(status string) float64 {
+	if status == "" {
+		return 0
+	}
+	if value, err := strconv.ParseFloat(status, 64); err == nil {
+		return value
+	}
+	switch strings.ToLower(status) {
+	case "running", "online", "ok", "healthy", "active":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func agentLabelValue(agent *model.Agent, getter func(*model.Agent) string) string {
+	if agent == nil {
+		return ""
+	}
+	return getter(agent)
 }

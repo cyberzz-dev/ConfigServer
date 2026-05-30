@@ -10,10 +10,12 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -84,9 +86,9 @@ func (h *AgentHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 	// Persist agent config statuses from the heartbeat.
 	h.saveConfigStatuses(r, req, instanceID)
 
-	// Resolve configs for this agent based on its tags.
-	agentTags := protoTagsToModel(req.Tags)
-	pipelines, instances, onetimes, err := h.mgr.GetConfigsForAgent(ctx, agentTags)
+	// Resolve configs for this agent based on its tags and attributes.
+	match := model.AgentMatchContext{IP: agent.IP, Tags: protoTagsToModel(req.Tags)}
+	pipelines, instances, onetimes, err := h.mgr.GetConfigsForAgent(ctx, match)
 	if err != nil {
 		log.Printf("ERROR: GetConfigsForAgent %s: %v", instanceID, err)
 		writeProtoResponse(w, buildErrHBResp(req.RequestId, 1, "internal error"))
@@ -177,18 +179,54 @@ func (h *AgentHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().Unix()
+	// Names present in the server store regardless of delivery deadline. Used to decide
+	// genuine cancellation: a command is cancelled ONLY when it has been deleted from the
+	// store, NOT merely because its delivery deadline (expire_time) has passed.
+	serverAllOnetimeNames := make(map[string]struct{}, len(onetimes))
 	for _, oc := range onetimes {
-		// Skip expired commands.
+		serverAllOnetimeNames[oc.Name] = struct{}{}
+	}
+	// Signal cancellation only for onetime configs the agent reports but the server has
+	// genuinely deleted. expire_time is purely a DELIVERY deadline (it bounds how long the
+	// server keeps offering the command to new agents); once delivered, the command's
+	// lifetime is governed by the agent's execution timeout, so a passed delivery deadline
+	// must NOT force-cancel an already-delivered (possibly still-running) onetime config.
+	// Use expire_time=-1 as the cancel/delete sentinel (analogous to version=-1 for ConfigDetail).
+	for name := range agentOnetime {
+		if _, ok := serverAllOnetimeNames[name]; !ok {
+			resp.OnetimePipelineConfigUpdates = append(resp.OnetimePipelineConfigUpdates, &protov2.CommandDetail{
+				Name:       name,
+				ExpireTime: -1,
+			})
+		}
+	}
+	for _, oc := range onetimes {
+		// Skip delivery of commands past their delivery deadline: do not offer them to
+		// agents that have not yet received them. Agents that already received the command
+		// keep running it under their own execution timeout and are not cancelled here.
 		if oc.ExpireTime > 0 && oc.ExpireTime < now {
 			continue
 		}
-		// Deliver only if the agent hasn't reported it yet (version=0 means unknown).
-		if _, seen := agentOnetime[oc.Name]; seen && !fullState {
-			continue
+		// Inject the command's generation (CreatedAt) into the detail so that a
+		// delete+recreate of a same-named command — which produces a new CreatedAt but may
+		// carry identical user content — yields different delivered bytes. This defeats the
+		// pure content-hash de-duplication below and lets the agent's execution layer treat
+		// the recreated command as a fresh run instead of resuming the old checkpoint.
+		detail := onetimeDetailWithGeneration(oc)
+		// Deliver only if the agent hasn't reported it yet, or if the server has a
+		// re-issued command with the same name but different content.  The agent
+		// reports the FNV-1a hash of the delivered detail as the version field;
+		// comparing it with onetimeContentHash(detail) detects same-name rewrites
+		// (including same-content recreations, thanks to the injected generation).
+		if agentVer, seen := agentOnetime[oc.Name]; seen && !fullState {
+			if agentVer == onetimeContentHash(detail) {
+				continue // agent already has this exact command
+			}
+			// Content differs: server re-issued the command; fall through to re-deliver.
 		}
 		resp.OnetimePipelineConfigUpdates = append(resp.OnetimePipelineConfigUpdates, &protov2.CommandDetail{
 			Name:       oc.Name,
-			Detail:     oc.Detail,
+			Detail:     detail,
 			ExpireTime: oc.ExpireTime,
 		})
 	}
@@ -302,7 +340,7 @@ func (h *AgentHandler) FetchConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		resp.OnetimePipelineConfigUpdates = append(resp.OnetimePipelineConfigUpdates, &protov2.CommandDetail{
 			Name:       oc.Name,
-			Detail:     oc.Detail,
+			Detail:     onetimeDetailWithGeneration(oc),
 			ExpireTime: oc.ExpireTime,
 		})
 	}
@@ -409,6 +447,64 @@ func indexConfigInfos(cfgs []*protov2.ConfigInfo) map[string]int64 {
 		m[c.Name] = c.Version
 	}
 	return m
+}
+
+// onetimeGenerationKey is the key under the pipeline config's "global" section that
+// carries the onetime command generation. The agent treats this as opaque config
+// content: it is part of the bytes hashed for the delivery version, written to disk,
+// and folded into the execution-layer inputs hash (see PipelineConfig.cpp), so that a
+// changed generation forces a fresh rerun rather than a checkpoint resume.
+const onetimeGenerationKey = "__onetime_generation__"
+
+// onetimeDetailWithGeneration returns oc.Detail with the command's generation
+// (CreatedAt in nanoseconds) injected into the "global" object under
+// onetimeGenerationKey. A delete+recreate of a same-named command yields a new
+// CreatedAt, so the returned bytes differ even when the user-supplied content is
+// identical; this is what makes the agent re-deliver and re-run the command.
+//
+// The detail is decoded with UseNumber() so existing numeric values (e.g. large
+// int64 parameters) are preserved verbatim and never degraded to float64. If the
+// detail is not a JSON object or the generation is unavailable, the original bytes
+// are returned unchanged (backward compatible with locally-created commands).
+func onetimeDetailWithGeneration(oc *model.OnetimeCommand) []byte {
+	gen := oc.CreatedAt.UnixNano()
+	if gen <= 0 {
+		return oc.Detail
+	}
+	dec := json.NewDecoder(bytes.NewReader(oc.Detail))
+	dec.UseNumber()
+	var root map[string]interface{}
+	if err := dec.Decode(&root); err != nil || root == nil {
+		return oc.Detail // not a JSON object; deliver as-is
+	}
+	global, ok := root["global"].(map[string]interface{})
+	if !ok {
+		global = map[string]interface{}{}
+	}
+	global[onetimeGenerationKey] = json.Number(strconv.FormatInt(gen, 10))
+	root["global"] = global
+	out, err := json.Marshal(root)
+	if err != nil {
+		return oc.Detail
+	}
+	return out
+}
+
+// onetimeContentHash computes the same FNV-1a 64-bit hash (masked to int64) as the
+// C++ ComputeOnetimeConfigVersion in CommonConfigProvider.cpp.  It is used to
+// decide whether the server's current command matches the version the agent already
+// reported, so that a same-name re-issued onetime command is re-delivered.
+func onetimeContentHash(detail []byte) int64 {
+	const (
+		offsetBasis = uint64(14695981039346656037)
+		prime       = uint64(1099511628211)
+	)
+	h := offsetBasis
+	for _, b := range detail {
+		h ^= uint64(b)
+		h *= prime
+	}
+	return int64(h & 0x7FFFFFFFFFFFFFFF)
 }
 
 func buildErrHBResp(reqID []byte, status int32, msg string) *protov2.HeartbeatResponse {

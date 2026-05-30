@@ -177,7 +177,71 @@ func (s *Store) RemoveGroupConfig(ctx context.Context, groupName, configName, co
 
 func (s *Store) GetGroupConfigs(ctx context.Context, groupName string) ([]*model.GroupConfigMapping, error) {
 	var mappings []*model.GroupConfigMapping
-	return mappings, s.db.WithContext(ctx).Where("group_name = ?", groupName).Find(&mappings).Error
+	if err := s.db.WithContext(ctx).Where("group_name = ?", groupName).Find(&mappings).Error; err != nil {
+		return nil, err
+	}
+	if len(mappings) == 0 {
+		return mappings, nil
+	}
+	// Defensive filtering: drop mappings whose underlying config no longer exists.
+	// This guards against orphaned rows left by historical data or partial deletes,
+	// so the Admin UI never shows a config that has already been removed.
+	pipelineNames := make([]string, 0)
+	instanceNames := make([]string, 0)
+	onetimeNames := make([]string, 0)
+	for _, m := range mappings {
+		switch m.ConfigType {
+		case model.ConfigTypePipeline:
+			pipelineNames = append(pipelineNames, m.ConfigName)
+		case model.ConfigTypeInstance:
+			instanceNames = append(instanceNames, m.ConfigName)
+		case model.ConfigTypeOnetime:
+			onetimeNames = append(onetimeNames, m.ConfigName)
+		}
+	}
+	existing := func(table string, column string, names []string) (map[string]struct{}, error) {
+		set := make(map[string]struct{}, len(names))
+		if len(names) == 0 {
+			return set, nil
+		}
+		var found []string
+		if err := s.db.WithContext(ctx).Table(table).
+			Where(column+" IN ?", names).Pluck(column, &found).Error; err != nil {
+			return nil, err
+		}
+		for _, n := range found {
+			set[n] = struct{}{}
+		}
+		return set, nil
+	}
+	pipelineExisting, err := existing(model.ResourcePipelineConfigs, "name", pipelineNames)
+	if err != nil {
+		return nil, err
+	}
+	instanceExisting, err := existing(model.ResourceInstanceConfigs, "name", instanceNames)
+	if err != nil {
+		return nil, err
+	}
+	onetimeExisting, err := existing(model.ResourceOnetimeCommands, "name", onetimeNames)
+	if err != nil {
+		return nil, err
+	}
+	filtered := mappings[:0]
+	for _, m := range mappings {
+		var keep bool
+		switch m.ConfigType {
+		case model.ConfigTypePipeline:
+			_, keep = pipelineExisting[m.ConfigName]
+		case model.ConfigTypeInstance:
+			_, keep = instanceExisting[m.ConfigName]
+		case model.ConfigTypeOnetime:
+			_, keep = onetimeExisting[m.ConfigName]
+		}
+		if keep {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered, nil
 }
 
 // ── Pipeline configs ──────────────────────────────────────────────────────────
@@ -276,7 +340,12 @@ func (s *Store) ListOnetimeCommands(ctx context.Context) ([]*model.OnetimeComman
 }
 
 func (s *Store) DeleteOnetimeCommand(ctx context.Context, name string) error {
-	return s.db.WithContext(ctx).Delete(&model.OnetimeCommand{}, "name = ?", name).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&model.OnetimeCommand{}, "name = ?", name).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&model.GroupConfigMapping{}, "config_name = ? AND config_type = ?", name, model.ConfigTypeOnetime).Error
+	})
 }
 
 // ── Agents ────────────────────────────────────────────────────────────────────
@@ -324,17 +393,17 @@ func (s *Store) GetAgentConfigStatuses(ctx context.Context, instanceID string) (
 
 func (s *Store) GetConfigsForAgent(
 	ctx context.Context,
-	agentTags []model.AgentGroupTag,
+	match model.AgentMatchContext,
 ) ([]*model.PipelineConfig, []*model.InstanceConfig, []*model.OnetimeCommand, error) {
 
 	// The default group always matches every agent regardless of tags.
-	groupNames := []string{model.DefaultGroupName}
+	groupNameSet := map[string]struct{}{model.DefaultGroupName: {}}
 
-	if len(agentTags) > 0 {
+	if len(match.Tags) > 0 {
 		// Build OR conditions: (tag_name = ? AND tag_value = ?) OR ...
-		conds := make([]string, len(agentTags))
-		args := make([]interface{}, 0, len(agentTags)*2)
-		for i, t := range agentTags {
+		conds := make([]string, len(match.Tags))
+		args := make([]interface{}, 0, len(match.Tags)*2)
+		for i, t := range match.Tags {
 			conds[i] = "(agt.tag_name = ? AND agt.tag_value = ?)"
 			args = append(args, t.TagName, t.TagValue)
 		}
@@ -359,11 +428,27 @@ WHERE matched.matched_count >= 1
 			return nil, nil, nil, fmt.Errorf("GetConfigsForAgent group query: %w", err)
 		}
 		for _, r := range rows {
-			if r.Name != model.DefaultGroupName {
-				groupNames = append(groupNames, r.Name)
+			groupNameSet[r.Name] = struct{}{}
+		}
+	}
+	if match.IP != "" {
+		var groups []*model.AgentGroup
+		if err := s.db.WithContext(ctx).
+			Where("ip_selector_json <> ''").
+			Find(&groups).Error; err != nil {
+			return nil, nil, nil, fmt.Errorf("GetConfigsForAgent ip selector group query: %w", err)
+		}
+		for _, group := range groups {
+			matched, err := model.IPSelectorMatches(group.IPSelectorJSON, match.IP)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("GetConfigsForAgent ip selector %s: %w", group.Name, err)
+			}
+			if matched {
+				groupNameSet[group.Name] = struct{}{}
 			}
 		}
 	}
+	groupNames := setKeys(groupNameSet)
 
 	// Fetch config mappings for matched groups.
 	var mappings []model.GroupConfigMapping

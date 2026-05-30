@@ -131,8 +131,13 @@ export interface Config {
 export interface AgentGroup {
   Name: string
   Description: string
+  IPSelectorJSON: string
   CreatedAt: string
   UpdatedAt: string
+}
+
+export interface GroupIPSelector {
+  ips: string[]
 }
 
 export interface GroupTag {
@@ -187,6 +192,13 @@ export const getGroupTags = (name: string) =>
   api.get<{ data: GroupTag[] }>(`/groups/${encodeURIComponent(name)}/tags`).then(r => r.data.data ?? [])
 export const setGroupTags = (name: string, tags: { TagName: string; TagValue: string }[]) =>
   api.put(`/groups/${encodeURIComponent(name)}/tags`, tags)
+export const getGroupIPSelector = (name: string) =>
+  api.get<{ data: GroupIPSelector }>(`/groups/${encodeURIComponent(name)}/ip-selector`)
+    .then(r => ({ ips: r.data.data?.ips ?? [] }))
+export const setGroupIPSelector = (name: string, selector: GroupIPSelector) =>
+  api.put(`/groups/${encodeURIComponent(name)}/ip-selector`, selector)
+export const deleteGroupIPSelector = (name: string) =>
+  api.delete(`/groups/${encodeURIComponent(name)}/ip-selector`)
 export const getGroupConfigs = (name: string) =>
   api.get<{ data: GroupConfigMapping[] }>(`/groups/${encodeURIComponent(name)}/configs`).then(r => r.data.data ?? [])
 export const addGroupConfig = (groupName: string, type: string, configName: string) =>

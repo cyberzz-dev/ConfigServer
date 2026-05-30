@@ -48,6 +48,7 @@ const (
 	prefixPipeline = "cfg:pipeline:"
 	prefixInstance = "cfg:instance:"
 	prefixAgent    = "agent:"
+	prefixStatus   = "agent_status:"
 	pubSubChannel  = "configserver:invalidate"
 
 	// agentRedisTTL is the TTL for agent entries stored in Redis (distributed mode).
@@ -69,9 +70,10 @@ func IsNotFound(err error) bool {
 	return errors.Is(err, gorm.ErrRecordNotFound)
 }
 
-// Manager wraps a store.Store with a two or three-tier cache.
-// Agent data (heartbeats and config statuses) is kept entirely in memory
-// and is intentionally ephemeral: it resets on every server restart.
+// Manager wraps a store.Store with a two or three-tier cache. Agent data
+// (heartbeats and config statuses) is kept in memory in all-in-one mode and is
+// additionally mirrored to Redis in distributed mode so the admin process can
+// expose a fleet-wide view.
 type Manager struct {
 	st    store.Store
 	l1    *freecache.Cache
@@ -308,10 +310,10 @@ func (m *Manager) subscribeInvalidations(ready chan struct{}) {
 // ── Ensure Manager exposes the helper needed by agent_handler ──────────────────
 
 // GetConfigsForAgent is a direct pass-through to the underlying store;
-// the result set depends on the agent's tags and cannot be meaningfully
+// the result set depends on the agent match context and cannot be meaningfully
 // cached at this layer without complex cache-key design.
-func (m *Manager) GetConfigsForAgent(ctx context.Context, agentTags []model.AgentGroupTag) ([]*model.PipelineConfig, []*model.InstanceConfig, []*model.OnetimeCommand, error) {
-	return m.st.GetConfigsForAgent(ctx, agentTags)
+func (m *Manager) GetConfigsForAgent(ctx context.Context, match model.AgentMatchContext) ([]*model.PipelineConfig, []*model.InstanceConfig, []*model.OnetimeCommand, error) {
+	return m.st.GetConfigsForAgent(ctx, match)
 }
 
 // Convenience wrappers so the rest of the server only holds a *Manager.
@@ -521,7 +523,10 @@ func (m *Manager) GetAgent(ctx context.Context, instanceID string) (*model.Agent
 	return nil, gorm.ErrRecordNotFound
 }
 
-func (m *Manager) ListAgents(_ context.Context) ([]*model.Agent, error) {
+func (m *Manager) ListAgents(ctx context.Context) ([]*model.Agent, error) {
+	if m.rdb != nil {
+		return m.listAgentsFromRedis(ctx)
+	}
 	m.agentsMu.RLock()
 	out := make([]*model.Agent, 0, len(m.agentsMap))
 	for _, a := range m.agentsMap {
@@ -677,16 +682,27 @@ func (m *Manager) ListAgentsPaged(ctx context.Context, group string, page, pageS
 	return filtered[start:end], total, nil
 }
 
-func (m *Manager) UpsertAgentConfigStatus(_ context.Context, status *model.AgentConfigStatus) error {
+func (m *Manager) UpsertAgentConfigStatus(ctx context.Context, status *model.AgentConfigStatus) error {
 	status.UpdatedAt = time.Now()
 	key := agentStatusKey(status.InstanceID, status.ConfigName, status.ConfigType)
 	m.statusesMu.Lock()
 	m.statusesMap[key] = status
 	m.statusesMu.Unlock()
+
+	if m.rdb != nil {
+		if raw, err := json.Marshal(status); err == nil {
+			if err := m.rdb.Set(ctx, prefixStatus+key, raw, agentRedisTTL).Err(); err != nil {
+				log.Printf("WARN: write agent config status to redis %s: %v", key, err)
+			}
+		}
+	}
 	return nil
 }
 
-func (m *Manager) GetAgentConfigStatuses(_ context.Context, instanceID string) ([]*model.AgentConfigStatus, error) {
+func (m *Manager) GetAgentConfigStatuses(ctx context.Context, instanceID string) ([]*model.AgentConfigStatus, error) {
+	if m.rdb != nil {
+		return m.listAgentConfigStatusesFromRedis(ctx, instanceID)
+	}
 	prefix := instanceID + "\x00"
 	m.statusesMu.RLock()
 	var out []*model.AgentConfigStatus
@@ -697,6 +713,55 @@ func (m *Manager) GetAgentConfigStatuses(_ context.Context, instanceID string) (
 	}
 	m.statusesMu.RUnlock()
 	return out, nil
+}
+
+func (m *Manager) ListAgentConfigStatuses(ctx context.Context) ([]*model.AgentConfigStatus, error) {
+	if m.rdb != nil {
+		return m.listAgentConfigStatusesFromRedis(ctx, "")
+	}
+	m.statusesMu.RLock()
+	out := make([]*model.AgentConfigStatus, 0, len(m.statusesMap))
+	for _, s := range m.statusesMap {
+		out = append(out, s)
+	}
+	m.statusesMu.RUnlock()
+	return out, nil
+}
+
+func (m *Manager) listAgentConfigStatusesFromRedis(ctx context.Context, instanceID string) ([]*model.AgentConfigStatus, error) {
+	pattern := prefixStatus + "*"
+	if instanceID != "" {
+		pattern = prefixStatus + instanceID + "\x00*"
+	}
+	var statuses []*model.AgentConfigStatus
+	var cursor uint64
+	for {
+		keys, nextCursor, err := m.rdb.Scan(ctx, cursor, pattern, 200).Result()
+		if err != nil {
+			return nil, err
+		}
+		if len(keys) > 0 {
+			vals, err := m.rdb.MGet(ctx, keys...).Result()
+			if err != nil {
+				return nil, err
+			}
+			for _, v := range vals {
+				if v == nil {
+					continue
+				}
+				var status model.AgentConfigStatus
+				if err := json.Unmarshal([]byte(v.(string)), &status); err != nil {
+					continue
+				}
+				statuses = append(statuses, &status)
+			}
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+	return statuses, nil
 }
 
 // Ensure *Manager satisfies store.Store so it can be used anywhere a store is expected.

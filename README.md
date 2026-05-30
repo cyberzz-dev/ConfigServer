@@ -60,6 +60,10 @@ LoongCollector 的配置管理服务，提供 Agent 配置下发、WebUI 管理�
 
 ![Agent 分组详情](images/manage-agent-grops-details.png)
 
+**Agent 分组 IP 选择器**
+
+![Agent 分组 IP 选择器](images/manage-agent-grops-ips.png)
+
 **Agent 分组回滚**
 
 ![Agent 分组回滚](images/manage-agent-groups-rollback.png)
@@ -90,6 +94,7 @@ LoongCollector 的配置管理服务，提供 Agent 配置下发、WebUI 管理�
 - [配置更新通知机制](#配置更新通知机制)
 - [配置历史与回滚](#配置历史与回滚)
 - [一次性命令（Onetime Commands）](#一次性命令onetime-commands)
+- [基于 IP 组的配置下发](#基于-ip-组的配置下发)
 - [REST API 参考](#rest-api-参考)
 - [故障排查](#故障排查)
 
@@ -511,6 +516,72 @@ curl -X POST http://localhost:8081/api/v1/history/onetime/debug-nginx-20260529/{
 
 ---
 
+## 基于 IP 组的配置下发
+
+除了**标签（Tag）匹配**之外，分组还支持通过 **IP 选择器**将配置下发到指定 IP 的 Agent。
+
+### 匹配语义
+
+Agent 满足以下任意条件即可从分组获取配置：
+
+| 条件 | 说明 |
+|------|------|
+| 默认分组（`default`） | 所有 Agent 始终获取默认分组的配置 |
+| 标签匹配 | Agent 心跳携带的标签与分组标签完全匹配 |
+| **IP 匹配** | Agent 的 IP 地址在分组的 IP 选择器范围内 |
+
+### IP 选择器规则格式
+
+IP 选择器支持以下三种规则，每行一条：
+
+| 格式 | 示例 | 说明 |
+|------|------|------|
+| 单个 IP | `192.168.1.5` | 精确匹配单个地址 |
+| 短程范围 | `192.168.1.200-230` | 同一 /24 网段内最后一段连续范围 |
+| 完整范围 | `10.0.0.1-10.0.0.254` | 任意起止 IP 范围（含两端） |
+| CIDR | `192.168.1.0/24`，`10.10.0.0/16` | 标准 CIDR 子网 |
+
+### 管理 IP 选择器
+
+**通过 WebUI**：进入「Agent 管理 → 分组」，点击对应分组行的 **IPs** 按钮，在弹窗中编辑规则（每行一条），保存后立即生效。
+
+**通过 REST API**：
+
+```bash
+# 查看当前 IP 选择器
+curl http://localhost:8081/api/v1/groups/app_group1/ip-selector
+# 响应: {"ips":["192.168.1.200-230","10.0.0.0/24"]}
+
+# 设置 IP 选择器
+curl -X PUT http://localhost:8081/api/v1/groups/app_group1/ip-selector \
+  -H 'Content-Type: application/json' \
+  -d '{"ips":["192.168.1.2","192.168.1.200-230","10.10.0.0/16"]}'
+
+# 清空 IP 选择器（该分组不再按 IP 匹配）
+curl -X DELETE http://localhost:8081/api/v1/groups/app_group1/ip-selector
+```
+
+### 示例：按 IP 段下发配置
+
+```bash
+# 1. 创建分组
+curl -X POST http://localhost:8081/api/v1/groups \
+  -H 'Content-Type: application/json' \
+  -d '{"Name":"app_group1","Description":"应用服务器组"}'
+
+# 2. 设置 IP 选择器（覆盖 192.168.1.2 和 192.168.1.200-230）
+curl -X PUT http://localhost:8081/api/v1/groups/app_group1/ip-selector \
+  -H 'Content-Type: application/json' \
+  -d '{"ips":["192.168.1.2","192.168.1.200-230"]}'
+
+# 3. 将 Pipeline 配置关联到该分组
+curl -X PUT http://localhost:8081/api/v1/groups/app_group1/configs/pipeline/nginx-access-log
+
+# 结果：IP 在上述范围内的 Agent 心跳时将自动获取 nginx-access-log 配置
+```
+
+---
+
 ## REST API 参考
 
 Admin API 基础路径：`http://<admin-host>:8081`。所有写操作接口需携带有效 session cookie（先调用 `/api/v1/auth/login` 获取）。
@@ -546,6 +617,9 @@ Admin API 基础路径：`http://<admin-host>:8081`。所有写操作接口需�
 | DELETE | `/api/v1/groups/{name}` | 删除分组 |
 | GET | `/api/v1/groups/{name}/tags` | 获取分组标签 |
 | PUT | `/api/v1/groups/{name}/tags` | 设置分组标签 |
+| GET | `/api/v1/groups/{name}/ip-selector` | 获取分组 IP 选择器 |
+| PUT | `/api/v1/groups/{name}/ip-selector` | 设置分组 IP 选择器（单 IP / 范围 / CIDR）|
+| DELETE | `/api/v1/groups/{name}/ip-selector` | 清空分组 IP 选择器 |
 | GET | `/api/v1/groups/{name}/configs` | 查看分组下关联的配置 |
 | PUT | `/api/v1/groups/{name}/configs/{type}/{configName}` | 添加配置到分组 |
 | DELETE | `/api/v1/groups/{name}/configs/{type}/{configName}` | 从分组移除配置 |

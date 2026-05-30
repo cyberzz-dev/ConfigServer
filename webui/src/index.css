@@ -237,11 +237,13 @@ body {
 [data-theme="dark"] .status-applied  { color: #81c995; background: #0d2318; border-color: #1e6b3a; }
 [data-theme="dark"] .status-applying { color: #fdd663; background: #231b00; border-color: #6b5200; }
 [data-theme="dark"] .status-failed   { color: #f28b82; background: #2d0d0d; border-color: #8b1a1a; }
+[data-theme="dark"] .status-deleted  { color: #9aa0a6; background: #1f1f1f; border-color: #3c4043; }
 [data-theme="dark"] .status-unknown  { color: #9aa0a6; background: #2d2e30; border-color: #3c4043; }
 /* light theme */
 [data-theme="light"] .status-applied  { color: #135200; background: #f6ffed; border-color: #b7eb8f; }
 [data-theme="light"] .status-applying { color: #874d00; background: #fffbe6; border-color: #ffe58f; }
 [data-theme="light"] .status-failed   { color: #a8071a; background: #fff1f0; border-color: #ffccc7; }
+[data-theme="light"] .status-deleted  { color: #595959; background: #f5f5f5; border-color: #d9d9d9; }
 [data-theme="light"] .status-unknown  { color: #595959; background: #fafafa; border-color: #d9d9d9; }
 
 /* ── Tooltip theme overrides ─────────────────────────────────────────────── */

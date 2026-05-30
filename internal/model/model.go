@@ -28,10 +28,20 @@ const DefaultGroupName = "default"
 
 // AgentGroup represents a named group of agents.
 type AgentGroup struct {
-	Name        string `gorm:"primaryKey"`
-	Description string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	Name           string `gorm:"primaryKey"`
+	Description    string
+	IPSelectorJSON string `gorm:"type:text"`
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+type AgentMatchContext struct {
+	IP   string
+	Tags []AgentGroupTag
+}
+
+type AgentGroupIPSelector struct {
+	IPs []string `json:"ips"`
 }
 
 // AgentGroupTag is a key-value tag that defines group membership criteria.
