@@ -133,4 +133,22 @@ type Store interface {
 	CreateAuditLog(ctx context.Context, entry *model.AuditLog) error
 	// ListAuditLogs returns paginated audit entries, newest first.
 	ListAuditLogs(ctx context.Context, limit, offset int) ([]*model.AuditLog, int64, error)
+
+	// ── Canary releases ───────────────────────────────────────────────────
+	//
+	// A CanaryRelease record pairs with a PipelineConfig or InstanceConfig and
+	// carries an alternative Detail+Version to deliver to a subset of agents.
+	// Delivery percent is controlled by RolloutPercent [0,100].
+
+	// CreateCanary inserts a new canary release record.
+	CreateCanary(ctx context.Context, cr *model.CanaryRelease) error
+	// GetCanary returns the canary release for the given config, or an error
+	// if no canary is active for that config.
+	GetCanary(ctx context.Context, configName, configType string) (*model.CanaryRelease, error)
+	// ListCanaries returns all canary release records regardless of status.
+	ListCanaries(ctx context.Context) ([]*model.CanaryRelease, error)
+	// UpdateCanary saves changes to an existing canary release record.
+	UpdateCanary(ctx context.Context, cr *model.CanaryRelease) error
+	// DeleteCanary removes the canary release record for the given config.
+	DeleteCanary(ctx context.Context, configName, configType string) error
 }

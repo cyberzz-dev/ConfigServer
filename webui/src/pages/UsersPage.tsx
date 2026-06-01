@@ -1,23 +1,28 @@
 import { useEffect, useState } from 'react'
 import {
-  Table, Button, Modal, Form, Input, Space, message, Tag, Select,
+  Table, Button, Modal, Form, Input, Space, message, Tag, Select, Tooltip,
 } from 'antd'
-import { PlusOutlined, KeyOutlined } from '@ant-design/icons'
+import { PlusOutlined, KeyOutlined, EditOutlined, SaveOutlined, CloseOutlined } from '@ant-design/icons'
 import type { User, Role } from '../api'
 import {
   listUsers, createUser, deleteUser, resetUserPassword, assignUserRole, listRoles,
 } from '../api'
 import DeleteConfirmModal from '../components/DeleteConfirmModal'
+import { useCurrentUser } from '../PermissionContext'
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function UsersPage() {
+  const currentUser = useCurrentUser()
   const [users, setUsers]           = useState<User[]>([])
   const [roles, setRoles]           = useState<Role[]>([])
   const [loading, setLoading]       = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [resetTarget, setReset]     = useState<User | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<User | null>(null)
+  const [editingUsername, setEditingUsername] = useState<string | null>(null)
+  const [editingRole, setEditingRole]         = useState<string>('')
+  const [savingRole, setSavingRole]           = useState(false)
   const [form] = Form.useForm()
   const [resetForm] = Form.useForm()
 
@@ -70,13 +75,27 @@ export default function UsersPage() {
     }
   }
 
-  const handleRoleChange = async (username: string, roleName: string) => {
+  const startEdit = (u: User) => {
+    setEditingUsername(u.username)
+    setEditingRole(u.role_name || '')
+  }
+
+  const cancelEdit = () => {
+    setEditingUsername(null)
+    setEditingRole('')
+  }
+
+  const saveEdit = async (u: User) => {
+    setSavingRole(true)
     try {
-      await assignUserRole(username, roleName)
+      await assignUserRole(u.username, editingRole)
       message.success('Role updated')
-      setUsers(prev => prev.map(u => u.username === username ? { ...u, role_name: roleName } : u))
+      setUsers(prev => prev.map(x => x.username === u.username ? { ...x, role_name: editingRole } : x))
+      setEditingUsername(null)
     } catch (e: any) {
       message.error(e?.response?.data?.message ?? 'Failed to update role')
+    } finally {
+      setSavingRole(false)
     }
   }
 
@@ -96,34 +115,84 @@ export default function UsersPage() {
       ),
     },
     {
-      title: 'Role', key: 'role_name', width: 200,
-      render: (_: unknown, u: User) =>
-        u.is_admin ? <Tag color="blue">Admin (all access)</Tag> : (
-          <Select
-            size="small"
-            style={{ width: 180 }}
-            value={u.role_name || ''}
-            options={roleOptions}
-            onChange={val => handleRoleChange(u.username, val)}
-          />
-        ),
+      title: 'Role', key: 'role_name', width: 220,
+      render: (_: unknown, u: User) => {
+        if (u.is_admin) return <Tag color="blue">Admin (all access)</Tag>
+        if (editingUsername === u.username) {
+          return (
+            <Select
+              size="small"
+              style={{ width: 180 }}
+              value={editingRole}
+              options={roleOptions}
+              onChange={val => setEditingRole(val)}
+              autoFocus
+            />
+          )
+        }
+        return u.role_name
+          ? <Tag>{u.role_name}</Tag>
+          : <span style={{ color: '#bfbfbf' }}>—</span>
+      },
     },
     {
-      title: 'Actions', key: 'actions', width: 200,
-      render: (_: unknown, u: User) => (
-        <Space size={4}>
-          <Button
-            size="small"
-            icon={<KeyOutlined />}
-            onClick={() => { setReset(u); resetForm.resetFields() }}
-          >
-            Reset Password
-          </Button>
-          {!u.is_admin && (
-            <Button size="small" danger onClick={() => setDeleteTarget(u)}>Delete</Button>
-          )}
-        </Space>
-      ),
+      title: 'Actions', key: 'actions', width: 260,
+      render: (_: unknown, u: User) => {
+        if (editingUsername === u.username) {
+          return (
+            <Space size={4}>
+              <Button
+                size="small"
+                type="primary"
+                icon={<SaveOutlined />}
+                loading={savingRole}
+                onClick={() => saveEdit(u)}
+              >
+                Save
+              </Button>
+              <Button size="small" icon={<CloseOutlined />} onClick={cancelEdit}>
+                Cancel
+              </Button>
+            </Space>
+          )
+        }
+        return (
+          <Space size={4}>
+            {!u.is_admin && (
+              <Tooltip title="Edit role">
+                <Button
+                  size="small"
+                  icon={<EditOutlined />}
+                  onClick={() => startEdit(u)}
+                  disabled={editingUsername !== null}
+                >
+                  Edit
+                </Button>
+              </Tooltip>
+            )}
+            {currentUser?.username !== u.username && (
+              <Button
+                size="small"
+                icon={<KeyOutlined />}
+                onClick={() => { setReset(u); resetForm.resetFields() }}
+                disabled={editingUsername !== null}
+              >
+                Reset Password
+              </Button>
+            )}
+            {!u.is_admin && (
+              <Button
+                size="small"
+                danger
+                onClick={() => setDeleteTarget(u)}
+                disabled={editingUsername !== null}
+              >
+                Delete
+              </Button>
+            )}
+          </Space>
+        )
+      },
     },
   ]
 

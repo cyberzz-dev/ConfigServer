@@ -46,14 +46,25 @@
 }
 
 /* ── Autofill override ───────────────────────────────────────────────────── */
-input:-webkit-autofill,
-input:-webkit-autofill:hover,
-input:-webkit-autofill:focus,
-input:-webkit-autofill:active {
-  -webkit-box-shadow: 0 0 0 1000px var(--autofill-bg) inset !important;
-  box-shadow: 0 0 0 1000px var(--autofill-bg) inset !important;
-  -webkit-text-fill-color: var(--text-primary) !important;
-  caret-color: var(--text-primary);
+/* Note: CSS variables (var()) are NOT supported inside :-webkit-autofill in  */
+/* some Chromium versions, so we use hard-coded colors per theme here.        */
+[data-theme="dark"] input:-webkit-autofill,
+[data-theme="dark"] input:-webkit-autofill:hover,
+[data-theme="dark"] input:-webkit-autofill:focus,
+[data-theme="dark"] input:-webkit-autofill:active {
+  -webkit-box-shadow: 0 0 0 1000px #35363a inset !important;
+  box-shadow: 0 0 0 1000px #35363a inset !important;
+  -webkit-text-fill-color: #e8eaed !important;
+  caret-color: #e8eaed;
+}
+[data-theme="light"] input:-webkit-autofill,
+[data-theme="light"] input:-webkit-autofill:hover,
+[data-theme="light"] input:-webkit-autofill:focus,
+[data-theme="light"] input:-webkit-autofill:active {
+  -webkit-box-shadow: 0 0 0 1000px #fafafa inset !important;
+  box-shadow: 0 0 0 1000px #fafafa inset !important;
+  -webkit-text-fill-color: #000000d9 !important;
+  caret-color: #000000d9;
 }
 
 body {
@@ -161,7 +172,8 @@ body {
   background: var(--table-row-stripe) !important;
 }
 .ant-table-tbody > tr:hover:not(.ant-table-expanded-row),
-.ant-table-tbody > tr:hover > td {
+.ant-table-tbody > tr:hover > td,
+.ant-table-cell-row-hover {
   background: var(--table-row-hover) !important;
 }
 /* Ant Design tints the active sorted-column's cells with its own background.
@@ -394,4 +406,20 @@ body {
 }
 .ant-form-item-label > label.ant-form-item-required:not(.ant-form-item-required-mark-optional)::before {
   color: #f28b82 !important;
+}
+
+/* ── Inline code element (used in modal hints) ───────────────────────────── */
+[data-theme="dark"] code {
+  background: rgba(255, 255, 255, 0.08) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  color: #e8eaed !important;
+  border-radius: 3px;
+  padding: 0.1em 0.4em;
+}
+[data-theme="light"] code {
+  background: rgba(0, 0, 0, 0.04) !important;
+  border: 1px solid rgba(0, 0, 0, 0.1) !important;
+  color: inherit;
+  border-radius: 3px;
+  padding: 0.1em 0.4em;
 }

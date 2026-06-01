@@ -448,6 +448,34 @@ WHERE matched.matched_count >= 1
 			}
 		}
 	}
+	// Apply version constraint filtering: for each non-default group that has a
+	// VersionConstraint, exclude the group if the agent's version doesn't satisfy it.
+	if len(groupNameSet) > 1 { // more than just default
+		nonDefault := make([]string, 0, len(groupNameSet)-1)
+		for name := range groupNameSet {
+			if name != model.DefaultGroupName {
+				nonDefault = append(nonDefault, name)
+			}
+		}
+		type vcRow struct {
+			Name              string
+			VersionConstraint string
+		}
+		var vcRows []vcRow
+		if err := s.db.WithContext(ctx).
+			Model(&model.AgentGroup{}).
+			Select("name, version_constraint").
+			Where("name IN ?", nonDefault).
+			Find(&vcRows).Error; err != nil {
+			return nil, nil, nil, fmt.Errorf("GetConfigsForAgent version constraint query: %w", err)
+		}
+		for _, row := range vcRows {
+			if row.VersionConstraint != "" && !model.MatchVersionConstraint(row.VersionConstraint, match.Version) {
+				delete(groupNameSet, row.Name)
+			}
+		}
+	}
+
 	groupNames := setKeys(groupNameSet)
 
 	// Fetch config mappings for matched groups.
@@ -497,6 +525,49 @@ WHERE matched.matched_count >= 1
 		names := setKeys(onetimeSet)
 		if err := s.db.WithContext(ctx).Where("name IN ?", names).Find(&onetimeCommands).Error; err != nil {
 			return nil, nil, nil, fmt.Errorf("GetConfigsForAgent onetime query: %w", err)
+		}
+	}
+
+	// ── Canary overlay ───────────────────────────────────────────────────────────
+	// For configs that have an active ("rolling") canary, replace Detail+Version
+	// for agents that satisfy the canary's version/IP/tag filters and whose
+	// Hostid-based bucket falls within RolloutPercent.
+	var canaries []*model.CanaryRelease
+	if err := s.db.WithContext(ctx).Where("status = ?", model.CanaryStatusRolling).Find(&canaries).Error; err != nil {
+		return nil, nil, nil, fmt.Errorf("GetConfigsForAgent canary query: %w", err)
+	}
+	if len(canaries) > 0 {
+		crMap := make(map[string]*model.CanaryRelease, len(canaries))
+		for _, cr := range canaries {
+			crMap[cr.ConfigName+"\x00"+cr.ConfigType] = cr
+		}
+		for _, cfg := range pipelineConfigs {
+			cr, ok := crMap[cfg.Name+"\x00"+model.ConfigTypePipeline]
+			if !ok {
+				continue
+			}
+			eligible, err := model.CanaryEligible(cr, match, cfg.Name)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("GetConfigsForAgent canary eligibility %s: %w", cfg.Name, err)
+			}
+			if eligible {
+				cfg.Detail = cr.CanaryDetail
+				cfg.Version = cr.CanaryVersion
+			}
+		}
+		for _, cfg := range instanceConfigs {
+			cr, ok := crMap[cfg.Name+"\x00"+model.ConfigTypeInstance]
+			if !ok {
+				continue
+			}
+			eligible, err := model.CanaryEligible(cr, match, cfg.Name)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("GetConfigsForAgent canary eligibility %s: %w", cfg.Name, err)
+			}
+			if eligible {
+				cfg.Detail = cr.CanaryDetail
+				cfg.Version = cr.CanaryVersion
+			}
 		}
 	}
 
@@ -659,4 +730,35 @@ func (s *Store) ListAuditLogs(ctx context.Context, limit, offset int) ([]*model.
 	var logs []*model.AuditLog
 	err := s.db.WithContext(ctx).Order("created_at DESC").Limit(limit).Offset(offset).Find(&logs).Error
 	return logs, total, err
+}
+
+// ── Canary releases ───────────────────────────────────────────────────────────
+
+func (s *Store) CreateCanary(ctx context.Context, cr *model.CanaryRelease) error {
+	return s.db.WithContext(ctx).Create(cr).Error
+}
+
+func (s *Store) GetCanary(ctx context.Context, configName, configType string) (*model.CanaryRelease, error) {
+	var cr model.CanaryRelease
+	err := s.db.WithContext(ctx).First(&cr, "config_name = ? AND config_type = ?", configName, configType).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &cr, nil
+}
+
+func (s *Store) ListCanaries(ctx context.Context) ([]*model.CanaryRelease, error) {
+	var crs []*model.CanaryRelease
+	return crs, s.db.WithContext(ctx).Find(&crs).Error
+}
+
+func (s *Store) UpdateCanary(ctx context.Context, cr *model.CanaryRelease) error {
+	return s.db.WithContext(ctx).Save(cr).Error
+}
+
+func (s *Store) DeleteCanary(ctx context.Context, configName, configType string) error {
+	return s.db.WithContext(ctx).Delete(&model.CanaryRelease{}, "config_name = ? AND config_type = ?", configName, configType).Error
 }

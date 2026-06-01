@@ -31,13 +31,21 @@ type AgentGroup struct {
 	Name           string `gorm:"primaryKey"`
 	Description    string
 	IPSelectorJSON string `gorm:"type:text"`
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// VersionConstraint limits config delivery to agents whose version satisfies the
+	// constraint. Empty means "match all versions". Format: comma-separated clauses
+	// each of the form "<op> <version>" where op ∈ {>=, >, <=, <, =}.
+	// Example: ">= 1.2.0, < 2.0.0".
+	VersionConstraint string `gorm:"not null;default:''"`
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 type AgentMatchContext struct {
-	IP   string
-	Tags []AgentGroupTag
+	IP       string
+	Hostid   string // machine-stable ID (OTel host.id); does not change across restarts
+	Hostname string // fallback when Hostid is empty
+	Version  string
+	Tags     []AgentGroupTag
 }
 
 type AgentGroupIPSelector struct {
@@ -140,6 +148,44 @@ type AuditLog struct {
 	CreatedAt    time.Time `gorm:"not null;index"`
 }
 
+// CanaryStatus constants for CanaryRelease.Status.
+const (
+	CanaryStatusRolling  = "rolling"
+	CanaryStatusPaused   = "paused"
+	CanaryStatusPromoted = "promoted"
+	CanaryStatusAborted  = "aborted"
+)
+
+// CanaryRelease tracks a gradual (canary) rollout of a new config version.
+// The stable content remains in PipelineConfig / InstanceConfig. Agents whose
+// Hostid FNV-bucket falls in [0, RolloutPercent) receive CanaryDetail instead.
+// Promote  → copy CanaryDetail into the stable config table then delete this row.
+// Abort    → delete this row; all agents fall back to the stable version on next heartbeat.
+type CanaryRelease struct {
+	ConfigName    string `gorm:"primaryKey"`
+	ConfigType    string `gorm:"primaryKey"` // pipeline | instance
+	CanaryDetail  []byte `gorm:"type:blob"`
+	CanaryVersion int64  `gorm:"not null"`
+	// RolloutPercent is the percentage [0,100] of the host population that
+	// receives the canary version. Hosts are bucketed by Hostid+configName hash.
+	RolloutPercent int `gorm:"not null;default:0"`
+	// VersionConstraint optionally limits which agent versions participate in the
+	// canary. Empty string means all versions. Same syntax as AgentGroup.VersionConstraint.
+	VersionConstraint string `gorm:"not null;default:''"`
+	// IPSelectorJSON optionally restricts the canary to agents whose IP matches.
+	// Same format as AgentGroup.IPSelectorJSON: {"ips":["10.0.0.1","10.1.0.0/16","10.2.0.1-10"]}.
+	// Empty string means no IP restriction.
+	IPSelectorJSON string `gorm:"type:text;not null;default:''"`
+	// TagSelectorJSON optionally restricts the canary to agents carrying at least
+	// one of the listed tags (ANY-match). Format: {"tags":[{"name":"env","value":"canary"}]}.
+	// Empty string means no tag restriction.
+	TagSelectorJSON string `gorm:"type:text;not null;default:''"`
+	Status          string `gorm:"not null;default:'rolling'"` // rolling|paused|promoted|aborted
+	CreatedBy       string `gorm:"not null;default:''"`
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 // User stores user account credentials and optional role assignment.
 // The built-in "admin" account is marked with IsAdmin=true and bypasses all
 // per-resource permission checks. Additional users are restricted to the
@@ -204,6 +250,7 @@ func MigrateAll(db *gorm.DB) error {
 		&RolePermission{},
 		&ConfigHistory{},
 		&AuditLog{},
+		&CanaryRelease{},
 	); err != nil {
 		return err
 	}

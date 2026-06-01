@@ -132,8 +132,8 @@ function ReadonlyPayloadViewer({ value, style }: { value: string; style?: CSSPro
   return (
     <div style={{
       maxHeight: '60vh', overflow: 'auto', margin: 0, fontSize: 12,
-      background: '#fff', border: '1px solid #d9d9d9', borderRadius: 6,
-      color: '#1f1f1f', fontFamily: 'monospace', lineHeight: '20px',
+      background: 'var(--input-bg)', border: '1px solid var(--input-border)', borderRadius: 6,
+      color: 'var(--text-primary)', fontFamily: 'monospace', lineHeight: '20px',
       ...style,
     }}>
       {lines.map((line, index) => (
@@ -141,7 +141,7 @@ function ReadonlyPayloadViewer({ value, style }: { value: string; style?: CSSPro
           <span style={{
             width: lineNoWidth, flexShrink: 0, boxSizing: 'border-box',
             padding: '0 8px 0 6px', textAlign: 'right', userSelect: 'none',
-            color: '#8c8c8c', background: '#fafafa', borderRight: '1px solid #f0f0f0',
+            color: 'var(--text-tertiary)', background: 'var(--bg-elevated)', borderRight: '1px solid var(--border-color)',
           }}>{index + 1}</span>
           <span style={{ whiteSpace: 'pre', padding: '0 8px' }}>{line || ' '}</span>
         </div>
@@ -421,24 +421,30 @@ function PipelinePanel() {
         })}
         rowClassName={r => r.name === selectedRow ? 'row-selected' : ''}
       />
-      <Modal title={editing ? <span>Edit Pipeline Config for <span style={{ display: 'inline-block', background: 'rgba(22,119,255,0.12)', color: '#1677ff', borderRadius: 4, padding: '1px 8px', fontWeight: 600, fontFamily: 'monospace', fontSize: '0.92em' }}>{editing.name}</span></span> : 'Create Pipeline Config'} open={open}
+      <Modal title={editing ? `Edit Pipeline Config — ${editing.name}` : 'Create Pipeline Config'} open={open}
         onOk={save} onCancel={() => setOpen(false)} width="90vw" style={{ maxWidth: 1200 }}>
         <Form form={form} layout="vertical">
           {!editing && (
-            <Form.Item name="name" label="Name" rules={[{ required: true }]}>
+            <Form.Item name="name" label="Name" rules={[
+              { required: true },
+              { pattern: /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/, message: 'Name must start with a letter, digit, or _ and only contain letters, digits, - and _' },
+            ]}>
               <Input placeholder="config-name" />
             </Form.Item>
           )}
-          <Form.Item label="Detail" style={{ marginBottom: 0 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-              {fmt === 'yaml' && <Tag color="blue">YAML → saved as JSON</Tag>}
-              {fmt === 'json' && <Tag color="green">JSON</Tag>}
-              {fmt === 'unknown' && detail.trim() && <Tag color="red">Invalid format</Tag>}
-              <Button size="small" onClick={handleToYaml} disabled={fmt !== 'json'}>To YAML</Button>
-              <Button size="small" onClick={handleToJson} disabled={fmt !== 'yaml'}>To JSON</Button>
-            </div>
-            <LineNumberedEditor value={detail} onChange={setDetail}
-              style={{ height: '60vh', resize: 'vertical' }} />
+          <Form.Item style={{ marginBottom: 0 }}>
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Space wrap>
+                {editing && <Tag color="blue">{editing.name}</Tag>}
+                {editing && <Tag>v{editing.version}</Tag>}
+                {(fmt === 'yaml' || fmt === 'json') && <Tag color="green">JSON</Tag>}
+                {fmt === 'unknown' && detail.trim() && <Tag color="red">Invalid format</Tag>}
+                <Button size="small" onClick={handleToYaml} disabled={fmt !== 'json'}>JSON to YAML</Button>
+                <Button size="small" onClick={handleToJson} disabled={fmt !== 'yaml'}>YAML to JSON</Button>
+              </Space>
+              <LineNumberedEditor value={detail} onChange={setDetail}
+                style={{ height: '60vh', resize: 'vertical' }} />
+            </Space>
           </Form.Item>
         </Form>
       </Modal>
@@ -565,6 +571,8 @@ function InstancePanel() {
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState<Config | null>(null)
   const [detail, setDetail] = useState('')
+  const [viewTarget, setViewTarget] = useState<Config | null>(null)
+  const [viewDetail, setViewDetail] = useState('')
   const [selectedRow, setSelectedRow] = useState<string | undefined>()
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [historyTarget, setHistoryTarget] = useState<string | null>(null)
@@ -597,6 +605,11 @@ function InstancePanel() {
     setDetail(formatted)
     form.setFieldsValue({ name: cfg.name }); setOpen(true)
   }
+  const openView = (cfg: Config) => {
+    setSelectedRow(cfg.name)
+    setViewTarget(cfg)
+    setViewDetail(formatDetail(cfg.detail))
+  }
   const openHistory = async (name: string) => {
     setHistoryTarget(name)
     setHistoryLoading(true)
@@ -610,6 +623,24 @@ function InstancePanel() {
     finally { setRecycleLoading(false) }
   }
   const fmt = useMemo(() => detectFormat(detail), [detail])
+  const viewFmt = useMemo(() => detectFormat(viewDetail), [viewDetail])
+
+  const handleViewToYaml = () => {
+    try { setViewDetail(toYaml(viewDetail)) }
+    catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
+  }
+  const handleViewToJson = () => {
+    try { setViewDetail(toJSON(viewDetail)) }
+    catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
+  }
+  const handleToYaml = () => {
+    try { setDetail(toYaml(detail)) }
+    catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
+  }
+  const handleToJson = () => {
+    try { setDetail(toJSON(detail)) }
+    catch (e) { message.error('Conversion failed: ' + (e instanceof Error ? e.message : String(e))) }
+  }
 
   const save = async () => {
     const vals = await form.validateFields()
@@ -641,9 +672,10 @@ function InstancePanel() {
       sorter: (a: Config, b: Config) => a.updated_at.localeCompare(b.updated_at),
       render: (v: string) => dayjs(v).format('YYYY-MM-DD HH:mm:ss') },
     {
-      title: 'Actions', key: 'act', width: 180,
+      title: 'Actions', key: 'act', width: 250,
       render: (_: unknown, r: Config) => (
         <Space size={4} onClick={e => e.stopPropagation()}>
+          <Button size="small" icon={<EyeOutlined />} onClick={() => openView(r)}>View</Button>
           {canUpdate && <Button size="small" onClick={() => openEdit(r)}>Edit</Button>}
           {canDelete && (
             <Button size="small" danger onClick={() => { setSelectedRow(r.name); setDeleteTarget(r.name) }}>Delete</Button>
@@ -678,28 +710,30 @@ function InstancePanel() {
         })}
         rowClassName={r => r.name === selectedRow ? 'row-selected' : ''}
       />
-      <Modal title={editing ? <span>Edit Instance Config for <span style={{ display: 'inline-block', background: 'rgba(22,119,255,0.12)', color: '#1677ff', borderRadius: 4, padding: '1px 8px', fontWeight: 600, fontFamily: 'monospace', fontSize: '0.92em' }}>{editing.name}</span></span> : 'Create Instance Config'} open={open}
+      <Modal title={editing ? `Edit Instance Config — ${editing.name}` : 'Create Instance Config'} open={open}
         onOk={save} onCancel={() => setOpen(false)} width="90vw" style={{ maxWidth: 1200 }}>
         <Form form={form} layout="vertical">
           {!editing && (
-            <Form.Item name="name" label="Name" rules={[{ required: true }]}>
+            <Form.Item name="name" label="Name" rules={[
+              { required: true },
+              { pattern: /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/, message: 'Name must start with a letter, digit, or _ and only contain letters, digits, - and _' },
+            ]}>
               <Input placeholder="instance-config-name" />
             </Form.Item>
           )}
-          <Form.Item
-            label={
-              <span>
-                Detail
-                {' '}
-                {fmt === 'yaml' && <Tag color="blue" style={{ marginLeft: 4 }}>YAML → saved as JSON</Tag>}
-                {fmt === 'json' && <Tag color="green" style={{ marginLeft: 4 }}>JSON</Tag>}
-                {fmt === 'unknown' && detail.trim() && <Tag color="red" style={{ marginLeft: 4 }}>Invalid format</Tag>}
-              </span>
-            }
-            style={{ marginBottom: 0 }}
-          >
-            <LineNumberedEditor value={detail} onChange={setDetail}
-              style={{ height: '60vh', resize: 'vertical' }} />
+          <Form.Item style={{ marginBottom: 0 }}>
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Space wrap>
+                {editing && <Tag color="blue">{editing.name}</Tag>}
+                {editing && <Tag>v{editing.version}</Tag>}
+                {(fmt === 'yaml' || fmt === 'json') && <Tag color="green">JSON</Tag>}
+                {fmt === 'unknown' && detail.trim() && <Tag color="red">Invalid format</Tag>}
+                <Button size="small" onClick={handleToYaml} disabled={fmt !== 'json'}>JSON to YAML</Button>
+                <Button size="small" onClick={handleToJson} disabled={fmt !== 'yaml'}>YAML to JSON</Button>
+              </Space>
+              <LineNumberedEditor value={detail} onChange={setDetail}
+                style={{ height: '60vh', resize: 'vertical' }} />
+            </Space>
           </Form.Item>
         </Form>
       </Modal>
@@ -710,6 +744,32 @@ function InstancePanel() {
         onConfirm={() => del(deleteTarget!)}
         onCancel={() => setDeleteTarget(null)}
       />
+      <Modal
+        title={`Instance Config — ${viewTarget?.name ?? ''}`}
+        open={viewTarget !== null}
+        onCancel={() => setViewTarget(null)}
+        width="90vw"
+        style={{ maxWidth: 1200 }}
+        footer={[
+          <Button key="copy" icon={<CopyOutlined />} onClick={() => copyText(viewDetail)}>COPY</Button>,
+          <Button key="close" type="primary" onClick={() => setViewTarget(null)}>Close</Button>,
+        ]}
+      >
+        {viewTarget && (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Space wrap>
+              <Tag color="blue">{viewTarget.name}</Tag>
+              <Tag>v{viewTarget.version}</Tag>
+              <Tag color={viewFmt === 'yaml' ? 'blue' : viewFmt === 'json' ? 'green' : 'red'}>
+                {viewFmt === 'yaml' ? 'YAML' : viewFmt === 'json' ? 'JSON' : 'Invalid format'}
+              </Tag>
+              <Button size="small" onClick={handleViewToYaml} disabled={viewFmt !== 'json'}>JSON to YAML</Button>
+              <Button size="small" onClick={handleViewToJson} disabled={viewFmt !== 'yaml'}>YAML to JSON</Button>
+            </Space>
+            <ReadonlyPayloadViewer value={viewDetail} />
+          </Space>
+        )}
+      </Modal>
       <Drawer
         title={`History — Instance Config "${historyTarget}"`}
         open={historyTarget !== null}
@@ -975,7 +1035,10 @@ function OnetimePanel() {
         onOk={save} onCancel={() => { setOpen(false); form.resetFields(); setDetail('') }}
         width="90vw" style={{ maxWidth: 900 }}>
         <Form form={form} layout="vertical" initialValues={{ expire_mode: 'absolute' }}>
-          <Form.Item name="name" label="Name" rules={[{ required: true }]}>
+          <Form.Item name="name" label="Name" rules={[
+            { required: true },
+            { pattern: /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/, message: 'Name must start with a letter, digit, or _ and only contain letters, digits, - and _' },
+          ]}>
             <Input placeholder="command-name" />
           </Form.Item>
           <Form.Item label="Expire Time (optional)">
@@ -1008,8 +1071,7 @@ function OnetimePanel() {
             label={
               <span>
                 Detail (command payload)
-                {fmt === 'yaml' && <Tag color="blue" style={{ marginLeft: 8 }}>YAML → saved as JSON</Tag>}
-                {fmt === 'json' && <Tag color="green" style={{ marginLeft: 8 }}>JSON</Tag>}
+                {(fmt === 'yaml' || fmt === 'json') && <Tag color="green" style={{ marginLeft: 8 }}>JSON</Tag>}
                 {fmt === 'unknown' && detail.trim() && <Tag color="red" style={{ marginLeft: 8 }}>Invalid format</Tag>}
               </span>
             }
