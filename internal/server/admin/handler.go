@@ -37,10 +37,11 @@ type AdminHandler struct {
 // groupSnapshot is stored as history Detail when a group is deleted,
 // enabling full restoration via rollback.
 type groupSnapshot struct {
-	Description    string                      `json:"description"`
-	IPSelectorJSON string                      `json:"ip_selector_json"`
-	Tags           []*model.AgentGroupTag      `json:"tags"`
-	Configs        []*model.GroupConfigMapping `json:"configs"`
+	Description       string                      `json:"description"`
+	IPSelectorJSON    string                      `json:"ip_selector_json"`
+	VersionConstraint string                      `json:"version_constraint"`
+	Tags              []*model.AgentGroupTag      `json:"tags"`
+	Configs           []*model.GroupConfigMapping `json:"configs"`
 }
 
 // NewAdminHandler creates an AdminHandler backed by the given cache manager.
@@ -77,6 +78,7 @@ func RegisterAdminRoutes(mux *http.ServeMux, h *AdminHandler) {
 	mux.HandleFunc("GET /api/v1/groups/{name}/ip-selector", h.GetGroupIPSelector)
 	mux.HandleFunc("PUT /api/v1/groups/{name}/ip-selector", h.SetGroupIPSelector)
 	mux.HandleFunc("DELETE /api/v1/groups/{name}/ip-selector", h.DeleteGroupIPSelector)
+	mux.HandleFunc("PUT /api/v1/groups/{name}/version-constraint", h.SetGroupVersionConstraint)
 
 	// Group ↔ config associations
 	mux.HandleFunc("GET /api/v1/groups/{name}/configs", h.GetGroupConfigs)
@@ -126,6 +128,18 @@ func RegisterAdminRoutes(mux *http.ServeMux, h *AdminHandler) {
 
 	// Audit logs
 	mux.HandleFunc("GET /api/v1/audit-logs", h.ListAuditLogs)
+
+	// Canary releases
+	mux.HandleFunc("GET /api/v1/canaries", h.ListCanaries)
+	mux.HandleFunc("POST /api/v1/configs/{type}/{name}/canary", h.CreateCanary)
+	mux.HandleFunc("PUT /api/v1/configs/{type}/{name}/canary", h.UpdateCanary)
+	mux.HandleFunc("GET /api/v1/configs/{type}/{name}/canary", h.GetCanary)
+	mux.HandleFunc("PUT /api/v1/configs/{type}/{name}/canary/percent", h.SetCanaryPercent)
+	mux.HandleFunc("POST /api/v1/configs/{type}/{name}/canary/pause", h.PauseCanary)
+	mux.HandleFunc("POST /api/v1/configs/{type}/{name}/canary/resume", h.ResumeCanary)
+	mux.HandleFunc("POST /api/v1/configs/{type}/{name}/canary/promote", h.PromoteCanary)
+	mux.HandleFunc("POST /api/v1/configs/{type}/{name}/canary/abort", h.AbortCanary)
+	mux.HandleFunc("GET /api/v1/configs/{type}/{name}/canary/stats", h.GetCanaryStats)
 }
 
 // ── JSON envelope ─────────────────────────────────────────────────────────────
@@ -457,6 +471,10 @@ func (h *AdminHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 		}
 		g.IPSelectorJSON, _ = model.MarshalIPSelector(selector)
 	}
+	if err := model.ValidateVersionConstraint(g.VersionConstraint); err != nil {
+		badRequest(w, "invalid version_constraint: "+err.Error())
+		return
+	}
 	if err := h.mgr.CreateGroup(r.Context(), &g); err != nil {
 		internalError(w, err)
 		return
@@ -519,6 +537,7 @@ func (h *AdminHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 	if g, err := h.mgr.GetGroup(r.Context(), name); err == nil {
 		snap.Description = g.Description
 		snap.IPSelectorJSON = g.IPSelectorJSON
+		snap.VersionConstraint = g.VersionConstraint
 	}
 	snap.Tags, _ = h.mgr.GetGroupTags(r.Context(), name)
 	snap.Configs, _ = h.mgr.GetGroupConfigs(r.Context(), name)
@@ -610,6 +629,39 @@ func (h *AdminHandler) DeleteGroupIPSelector(w http.ResponseWriter, r *http.Requ
 	h.saveHistory(r.Context(), "group", name, "set_ip_selector", 0, oldJSON)
 	h.logAudit(r, http.StatusOK, "set_ip_selector", "group", name, "(cleared)")
 	ok(w, model.AgentGroupIPSelector{IPs: []string{}})
+}
+
+func (h *AdminHandler) SetGroupVersionConstraint(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req struct {
+		VersionConstraint string `json:"version_constraint"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if err := model.ValidateVersionConstraint(req.VersionConstraint); err != nil {
+		badRequest(w, "invalid version_constraint: "+err.Error())
+		return
+	}
+	g, err := h.mgr.GetGroup(r.Context(), name)
+	if err != nil {
+		if isNotFound(err) {
+			notFound(w)
+			return
+		}
+		internalError(w, err)
+		return
+	}
+	old := g.VersionConstraint
+	g.VersionConstraint = req.VersionConstraint
+	if err := h.mgr.UpdateGroup(r.Context(), g); err != nil {
+		internalError(w, err)
+		return
+	}
+	h.saveHistory(r.Context(), "group", name, "set_version_constraint", 0, []byte(old))
+	h.logAudit(r, http.StatusOK, "set_version_constraint", "group", name, req.VersionConstraint)
+	ok(w, g)
 }
 
 func (h *AdminHandler) GetGroupTags(w http.ResponseWriter, r *http.Request) {
@@ -999,11 +1051,20 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 }
 
 // ResetUserPassword resets a user's password (admin only).
+// An admin may not reset their own password via this endpoint; they must use
+// POST /api/v1/auth/change-password which requires the current password.
 //
 //	PUT /api/v1/users/{username}/password
 func (h *AdminHandler) ResetUserPassword(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	username := r.PathValue("username")
+
+	// Block self-reset: the caller must use the change-password flow instead.
+	if caller, ok := userFromCtx(ctx); ok && caller.Username == username {
+		writeJSON(w, http.StatusForbidden, 403,
+			"cannot reset your own password via this endpoint; use Change Password instead", nil)
+		return
+	}
 
 	var body struct {
 		Password string `json:"password"`
@@ -1401,6 +1462,22 @@ func (h *AdminHandler) RollbackConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	case "group":
 		switch entry.Action {
+		case "set_version_constraint":
+			group, err2 := h.mgr.GetGroup(r.Context(), name)
+			if err2 != nil {
+				if isNotFound(err2) {
+					notFound(w)
+					return
+				}
+				internalError(w, err2)
+				return
+			}
+			oldDetail = []byte(group.VersionConstraint)
+			group.VersionConstraint = string(entry.Detail)
+			if err2 := h.mgr.UpdateGroup(r.Context(), group); err2 != nil {
+				internalError(w, err2)
+				return
+			}
 		case "set_ip_selector":
 			group, err2 := h.mgr.GetGroup(r.Context(), name)
 			if err2 != nil {
@@ -1481,6 +1558,7 @@ func (h *AdminHandler) RollbackConfig(w http.ResponseWriter, r *http.Request) {
 				// Override: update description, clear configs, then re-add from snapshot.
 				existingGroup.Description = snap.Description
 				existingGroup.IPSelectorJSON = snap.IPSelectorJSON
+				existingGroup.VersionConstraint = snap.VersionConstraint
 				if err2 = h.mgr.UpdateGroup(r.Context(), existingGroup); err2 != nil {
 					internalError(w, err2)
 					return
@@ -1492,9 +1570,10 @@ func (h *AdminHandler) RollbackConfig(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				if err2 = h.mgr.CreateGroup(r.Context(), &model.AgentGroup{
-					Name:           name,
-					Description:    snap.Description,
-					IPSelectorJSON: snap.IPSelectorJSON,
+					Name:              name,
+					Description:       snap.Description,
+					IPSelectorJSON:    snap.IPSelectorJSON,
+					VersionConstraint: snap.VersionConstraint,
 				}); err2 != nil {
 					internalError(w, err2)
 					return
@@ -1604,5 +1683,575 @@ func (h *AdminHandler) ListAuditLogs(w http.ResponseWriter, r *http.Request) {
 		"total":     total,
 		"page":      page,
 		"page_size": pageSize,
+	})
+}
+
+// ── Canary releases ───────────────────────────────────────────────────────────
+
+// canaryResp is the JSON representation of a CanaryRelease returned by the API.
+type canaryResp struct {
+	ConfigName        string            `json:"config_name"`
+	ConfigType        string            `json:"config_type"`
+	CanaryDetail      string            `json:"canary_detail"`
+	CanaryVersion     int64             `json:"canary_version"`
+	RolloutPercent    int               `json:"rollout_percent"`
+	VersionConstraint string            `json:"version_constraint,omitempty"`
+	IPSelector        []string          `json:"ip_selector,omitempty"`
+	TagSelector       []model.CanaryTag `json:"tag_selector,omitempty"`
+	Status            string            `json:"status"`
+	CreatedBy         string            `json:"created_by,omitempty"`
+	CreatedAt         string            `json:"created_at"`
+	UpdatedAt         string            `json:"updated_at"`
+}
+
+func canaryToResp(cr *model.CanaryRelease) canaryResp {
+	resp := canaryResp{
+		ConfigName:        cr.ConfigName,
+		ConfigType:        cr.ConfigType,
+		CanaryDetail:      string(cr.CanaryDetail),
+		CanaryVersion:     cr.CanaryVersion,
+		RolloutPercent:    cr.RolloutPercent,
+		VersionConstraint: cr.VersionConstraint,
+		Status:            cr.Status,
+		CreatedBy:         cr.CreatedBy,
+		CreatedAt:         cr.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:         cr.UpdatedAt.Format(time.RFC3339),
+	}
+	if cr.IPSelectorJSON != "" {
+		if sel, err := model.ParseIPSelectorJSON(cr.IPSelectorJSON); err == nil {
+			resp.IPSelector = sel.IPs
+		}
+	}
+	if cr.TagSelectorJSON != "" {
+		var sel model.CanaryTagSelector
+		if err := json.Unmarshal([]byte(cr.TagSelectorJSON), &sel); err == nil {
+			resp.TagSelector = sel.Tags
+		}
+	}
+	return resp
+}
+
+// configTypeFromPath maps the URL {type} path value to model config-type constants.
+// Valid values: "pipeline" → model.ConfigTypePipeline, "instance" → model.ConfigTypeInstance.
+func configTypeFromPath(raw string) (string, bool) {
+	switch raw {
+	case "pipeline":
+		return model.ConfigTypePipeline, true
+	case "instance":
+		return model.ConfigTypeInstance, true
+	}
+	return "", false
+}
+
+// ListCanaries returns all canary release records.
+func (h *AdminHandler) ListCanaries(w http.ResponseWriter, r *http.Request) {
+	crs, err := h.mgr.ListCanaries(r.Context())
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	resps := make([]canaryResp, len(crs))
+	for i, cr := range crs {
+		resps[i] = canaryToResp(cr)
+	}
+	ok(w, resps)
+}
+
+// CreateCanary starts a new canary release for a config.
+//
+// POST /api/v1/configs/{type}/{name}/canary
+// Body: { "canary_detail": "<yaml>", "rollout_percent": 0-100, "version_constraint": ">=1.2" }
+func (h *AdminHandler) CreateCanary(w http.ResponseWriter, r *http.Request) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+
+	var req struct {
+		CanaryDetail      string            `json:"canary_detail"`
+		RolloutPercent    int               `json:"rollout_percent"`
+		VersionConstraint string            `json:"version_constraint"`
+		IPSelector        []string          `json:"ip_selector"`
+		TagSelector       []model.CanaryTag `json:"tag_selector"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if req.RolloutPercent < 0 || req.RolloutPercent > 100 {
+		badRequest(w, "rollout_percent must be between 0 and 100")
+		return
+	}
+	if err := validateYAML([]byte(req.CanaryDetail)); err != nil {
+		badRequest(w, fmt.Sprintf("canary_detail: %v", err))
+		return
+	}
+
+	// Validate and serialize the optional IP selector.
+	ipSelectorJSON := ""
+	if len(req.IPSelector) > 0 {
+		normalized, err := model.NormalizeIPSelector(model.AgentGroupIPSelector{IPs: req.IPSelector})
+		if err != nil {
+			badRequest(w, fmt.Sprintf("ip_selector: %v", err))
+			return
+		}
+		ipSelectorJSON, err = model.MarshalIPSelector(normalized)
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+	}
+
+	// Validate and serialize the optional tag selector.
+	tagSelectorJSON := ""
+	if len(req.TagSelector) > 0 {
+		for _, t := range req.TagSelector {
+			if t.Name == "" {
+				badRequest(w, "tag_selector: tag name must not be empty")
+				return
+			}
+		}
+		raw, err := json.Marshal(model.CanaryTagSelector{Tags: req.TagSelector})
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+		tagSelectorJSON = string(raw)
+	}
+
+	createdBy := ""
+	if u, ok := userFromCtx(r.Context()); ok {
+		createdBy = u.Username
+	}
+
+	cr := &model.CanaryRelease{
+		ConfigName:        name,
+		ConfigType:        cfgType,
+		CanaryDetail:      []byte(req.CanaryDetail),
+		CanaryVersion:     time.Now().UnixMilli(),
+		RolloutPercent:    req.RolloutPercent,
+		VersionConstraint: req.VersionConstraint,
+		IPSelectorJSON:    ipSelectorJSON,
+		TagSelectorJSON:   tagSelectorJSON,
+		Status:            model.CanaryStatusRolling,
+		CreatedBy:         createdBy,
+	}
+	if err := h.mgr.CreateCanary(r.Context(), cr); err != nil {
+		internalError(w, err)
+		return
+	}
+	h.logAudit(r, http.StatusCreated, "canary-create", cfgType, name, req.CanaryDetail)
+	writeJSON(w, http.StatusCreated, 0, "created", canaryToResp(cr))
+}
+
+// UpdateCanary updates the canary_detail, rollout_percent, version_constraint, and
+// selector fields of an active (rolling or paused) canary release.
+//
+// PUT /api/v1/configs/{type}/{name}/canary
+// Body: { "canary_detail": "<yaml>", "rollout_percent": 0-100, "version_constraint": ">=1.2",
+//
+//	"ip_selector": [...], "tag_selector": [...] }
+func (h *AdminHandler) UpdateCanary(w http.ResponseWriter, r *http.Request) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+
+	var req struct {
+		CanaryDetail      string            `json:"canary_detail"`
+		RolloutPercent    int               `json:"rollout_percent"`
+		VersionConstraint string            `json:"version_constraint"`
+		IPSelector        []string          `json:"ip_selector"`
+		TagSelector       []model.CanaryTag `json:"tag_selector"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if req.RolloutPercent < 0 || req.RolloutPercent > 100 {
+		badRequest(w, "rollout_percent must be between 0 and 100")
+		return
+	}
+	if err := validateYAML([]byte(req.CanaryDetail)); err != nil {
+		badRequest(w, fmt.Sprintf("canary_detail: %v", err))
+		return
+	}
+
+	// Load existing canary to ensure it exists and is in an editable state.
+	cr, err := h.mgr.GetCanary(r.Context(), name, string(cfgType))
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if cr == nil {
+		notFound(w)
+		return
+	}
+	if cr.Status != model.CanaryStatusRolling && cr.Status != model.CanaryStatusPaused {
+		badRequest(w, "only rolling or paused canaries can be updated")
+		return
+	}
+
+	// Validate and serialize the optional IP selector.
+	ipSelectorJSON := ""
+	if len(req.IPSelector) > 0 {
+		normalized, err := model.NormalizeIPSelector(model.AgentGroupIPSelector{IPs: req.IPSelector})
+		if err != nil {
+			badRequest(w, fmt.Sprintf("ip_selector: %v", err))
+			return
+		}
+		ipSelectorJSON, err = model.MarshalIPSelector(normalized)
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+	}
+
+	// Validate and serialize the optional tag selector.
+	tagSelectorJSON := ""
+	if len(req.TagSelector) > 0 {
+		for _, t := range req.TagSelector {
+			if t.Name == "" {
+				badRequest(w, "tag_selector: tag name must not be empty")
+				return
+			}
+		}
+		raw, err := json.Marshal(model.CanaryTagSelector{Tags: req.TagSelector})
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+		tagSelectorJSON = string(raw)
+	}
+
+	cr.CanaryDetail = []byte(req.CanaryDetail)
+	cr.CanaryVersion = time.Now().UnixMilli()
+	cr.RolloutPercent = req.RolloutPercent
+	cr.VersionConstraint = req.VersionConstraint
+	cr.IPSelectorJSON = ipSelectorJSON
+	cr.TagSelectorJSON = tagSelectorJSON
+
+	if err := h.mgr.UpdateCanary(r.Context(), cr); err != nil {
+		internalError(w, err)
+		return
+	}
+	h.logAudit(r, http.StatusOK, "canary-update", cfgType, name, req.CanaryDetail)
+	ok(w, canaryToResp(cr))
+}
+
+// GetCanary returns the active canary release for a config.
+//
+// GET /api/v1/configs/{type}/{name}/canary
+func (h *AdminHandler) GetCanary(w http.ResponseWriter, r *http.Request) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+	cr, err := h.mgr.GetCanary(r.Context(), name, cfgType)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if cr == nil {
+		notFound(w)
+		return
+	}
+	ok(w, canaryToResp(cr))
+}
+
+// SetCanaryPercent adjusts the rollout percentage of an active canary.
+//
+// PUT /api/v1/configs/{type}/{name}/canary/percent
+// Body: { "rollout_percent": 0-100 }
+func (h *AdminHandler) SetCanaryPercent(w http.ResponseWriter, r *http.Request) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+
+	var req struct {
+		RolloutPercent int `json:"rollout_percent"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if req.RolloutPercent < 0 || req.RolloutPercent > 100 {
+		badRequest(w, "rollout_percent must be between 0 and 100")
+		return
+	}
+
+	cr, err := h.mgr.GetCanary(r.Context(), name, cfgType)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if cr == nil {
+		notFound(w)
+		return
+	}
+	if cr.Status != model.CanaryStatusRolling {
+		badRequest(w, fmt.Sprintf("canary is not in rolling status (current: %s)", cr.Status))
+		return
+	}
+	cr.RolloutPercent = req.RolloutPercent
+	if err := h.mgr.UpdateCanary(r.Context(), cr); err != nil {
+		internalError(w, err)
+		return
+	}
+	h.logAudit(r, http.StatusOK, "canary-set-percent", cfgType, name, strconv.Itoa(req.RolloutPercent))
+	ok(w, canaryToResp(cr))
+}
+
+// PauseCanary halts delivery of the canary version; agents will receive the stable version.
+//
+// POST /api/v1/configs/{type}/{name}/canary/pause
+func (h *AdminHandler) PauseCanary(w http.ResponseWriter, r *http.Request) {
+	h.setCanaryStatus(w, r, model.CanaryStatusRolling, model.CanaryStatusPaused, "canary-pause")
+}
+
+// ResumeCanary resumes a paused canary.
+//
+// POST /api/v1/configs/{type}/{name}/canary/resume
+func (h *AdminHandler) ResumeCanary(w http.ResponseWriter, r *http.Request) {
+	h.setCanaryStatus(w, r, model.CanaryStatusPaused, model.CanaryStatusRolling, "canary-resume")
+}
+
+// setCanaryStatus is shared logic for pause/resume transitions.
+func (h *AdminHandler) setCanaryStatus(w http.ResponseWriter, r *http.Request, requiredCurrent, newStatus, auditAction string) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+	cr, err := h.mgr.GetCanary(r.Context(), name, cfgType)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if cr == nil {
+		notFound(w)
+		return
+	}
+	if cr.Status != requiredCurrent {
+		badRequest(w, fmt.Sprintf("canary must be in '%s' status to perform this action (current: %s)", requiredCurrent, cr.Status))
+		return
+	}
+	cr.Status = newStatus
+	if err := h.mgr.UpdateCanary(r.Context(), cr); err != nil {
+		internalError(w, err)
+		return
+	}
+	h.logAudit(r, http.StatusOK, auditAction, cfgType, name, "")
+	ok(w, canaryToResp(cr))
+}
+
+// PromoteCanary copies the canary detail into the stable config table, then
+// deletes the canary record. All agents will receive the promoted version on
+// their next heartbeat.
+//
+// POST /api/v1/configs/{type}/{name}/canary/promote
+func (h *AdminHandler) PromoteCanary(w http.ResponseWriter, r *http.Request) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+	ctx := r.Context()
+
+	cr, err := h.mgr.GetCanary(ctx, name, cfgType)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if cr == nil {
+		notFound(w)
+		return
+	}
+
+	switch cfgType {
+	case model.ConfigTypePipeline:
+		cfg, err2 := h.mgr.GetPipelineConfig(ctx, name)
+		if err2 != nil {
+			internalError(w, err2)
+			return
+		}
+		if cfg == nil {
+			notFound(w)
+			return
+		}
+		oldDetail := cfg.Detail
+		cfg.Detail = cr.CanaryDetail
+		cfg.Version = time.Now().UnixMilli()
+		if err2 := h.mgr.UpdatePipelineConfig(ctx, cfg); err2 != nil {
+			internalError(w, err2)
+			return
+		}
+		h.saveHistory(ctx, "pipeline", name, "promote", cfg.Version, oldDetail)
+
+	case model.ConfigTypeInstance:
+		cfg, err2 := h.mgr.GetInstanceConfig(ctx, name)
+		if err2 != nil {
+			internalError(w, err2)
+			return
+		}
+		if cfg == nil {
+			notFound(w)
+			return
+		}
+		oldDetail := cfg.Detail
+		cfg.Detail = cr.CanaryDetail
+		cfg.Version = time.Now().UnixMilli()
+		if err2 := h.mgr.UpdateInstanceConfig(ctx, cfg); err2 != nil {
+			internalError(w, err2)
+			return
+		}
+		h.saveHistory(ctx, "instance", name, "promote", cfg.Version, oldDetail)
+	}
+
+	if err := h.mgr.DeleteCanary(ctx, name, cfgType); err != nil {
+		// Non-fatal: stable config was already updated; log and continue.
+		log.Printf("WARN: PromoteCanary delete canary record failed: %v", err)
+	}
+	h.logAudit(r, http.StatusOK, "canary-promote", cfgType, name, string(cr.CanaryDetail))
+	ok(w, map[string]string{"status": "promoted"})
+}
+
+// AbortCanary removes the canary record; all agents fall back to the stable
+// version on their next heartbeat.
+//
+// POST /api/v1/configs/{type}/{name}/canary/abort
+func (h *AdminHandler) AbortCanary(w http.ResponseWriter, r *http.Request) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+	cr, err := h.mgr.GetCanary(r.Context(), name, cfgType)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if cr == nil {
+		notFound(w)
+		return
+	}
+	if err := h.mgr.DeleteCanary(r.Context(), name, cfgType); err != nil {
+		internalError(w, err)
+		return
+	}
+	h.logAudit(r, http.StatusOK, "canary-abort", cfgType, name, "")
+	ok(w, map[string]string{"status": "aborted"})
+}
+
+// GetCanaryStats returns a summary of which hosts are receiving the canary version.
+// Hosts are identified by Hostid (falling back to Hostname when Hostid is empty)
+// to avoid double-counting the same machine after an agent process restart.
+//
+// GET /api/v1/configs/{type}/{name}/canary/stats
+func (h *AdminHandler) GetCanaryStats(w http.ResponseWriter, r *http.Request) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+	ctx := r.Context()
+
+	cr, err := h.mgr.GetCanary(ctx, name, cfgType)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if cr == nil {
+		notFound(w)
+		return
+	}
+
+	agents, err := h.mgr.ListAgents(ctx)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	// Deduplicate by stable host identity so that a restarted agent isn't
+	// counted twice (InstanceID changes on restart, but Hostid does not).
+	type hostEntry struct {
+		hostKey string // Hostid or Hostname
+		bucket  int
+	}
+	seen := make(map[string]struct{}, len(agents))
+	var canaryCount, stableCount, unknownCount int
+
+	for _, agent := range agents {
+		// Parse the agent's reported tags so IP/tag canary filters are honored.
+		var tagEntries []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}
+		var tags []model.AgentGroupTag
+		if agent.TagsJSON != "" {
+			if err := json.Unmarshal([]byte(agent.TagsJSON), &tagEntries); err == nil {
+				tags = make([]model.AgentGroupTag, 0, len(tagEntries))
+				for _, e := range tagEntries {
+					tags = append(tags, model.AgentGroupTag{TagName: e.Name, TagValue: e.Value})
+				}
+			}
+		}
+		match := model.AgentMatchContext{
+			IP:       agent.IP,
+			Hostid:   agent.Hostid,
+			Hostname: agent.Hostname,
+			Version:  agent.Version,
+			Tags:     tags,
+		}
+		_, hasBucket := model.CanaryBucket(match, name)
+		if !hasBucket {
+			unknownCount++
+			continue
+		}
+
+		// Deduplicate by stable host key.
+		key := agent.Hostid
+		if key == "" {
+			key = agent.Hostname
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		eligible, err := model.CanaryEligible(cr, match, name)
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+		if eligible {
+			canaryCount++
+		} else {
+			stableCount++
+		}
+	}
+
+	ok(w, map[string]any{
+		"config_name":     name,
+		"config_type":     cfgType,
+		"rollout_percent": cr.RolloutPercent,
+		"status":          cr.Status,
+		"canary_hosts":    canaryCount,
+		"stable_hosts":    stableCount,
+		"unknown_hosts":   unknownCount, // no stable identity — cannot bucket
+		"total_hosts":     canaryCount + stableCount + unknownCount,
 	})
 }

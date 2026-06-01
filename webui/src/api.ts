@@ -132,6 +132,7 @@ export interface AgentGroup {
   Name: string
   Description: string
   IPSelectorJSON: string
+  VersionConstraint: string
   CreatedAt: string
   UpdatedAt: string
 }
@@ -182,10 +183,14 @@ export const deleteInstanceConfig = (name: string) =>
 
 // Groups
 export const listGroups = () => api.get<{ data: AgentGroup[] }>('/groups').then(r => r.data.data ?? [])
+export const getGroup = (name: string) =>
+  api.get<{ data: AgentGroup }>(`/groups/${encodeURIComponent(name)}`).then(r => r.data.data)
 export const createGroup = (name: string, description: string) =>
   api.post('/groups', { Name: name, Description: description })
 export const updateGroup = (name: string, description: string) =>
   api.put(`/groups/${encodeURIComponent(name)}`, { description })
+export const setGroupVersionConstraint = (name: string, versionConstraint: string) =>
+  api.put(`/groups/${encodeURIComponent(name)}/version-constraint`, { version_constraint: versionConstraint })
 export const deleteGroup = (name: string) =>
   api.delete(`/groups/${encodeURIComponent(name)}`)
 export const getGroupTags = (name: string) =>
@@ -291,4 +296,80 @@ export interface AuditLogsResult {
 
 export const listAuditLogs = (page = 1, pageSize = 50) =>
   api.get<{ data: AuditLogsResult }>('/audit-logs', { params: { page, page_size: pageSize } }).then(r => r.data.data)
+
+// ── Canary releases ───────────────────────────────────────────────────────────
+
+export interface CanaryRelease {
+  config_name: string
+  config_type: string
+  canary_detail: string
+  canary_version: number
+  rollout_percent: number
+  version_constraint: string
+  ip_selector?: string[]
+  tag_selector?: { name: string; value: string }[]
+  status: string
+  created_by: string
+  created_at: string
+  updated_at: string
+}
+
+export interface CanaryStats {
+  config_name: string
+  config_type: string
+  rollout_percent: number
+  status: string
+  canary_hosts: number
+  stable_hosts: number
+  unknown_hosts: number
+  total_hosts: number
+}
+
+export const listCanaries = () =>
+  api.get<{ data: CanaryRelease[] }>('/canaries').then(r => r.data.data ?? [])
+
+export const createCanary = (
+  type: string, name: string,
+  payload: {
+    canary_detail: string
+    rollout_percent: number
+    version_constraint?: string
+    ip_selector?: string[]
+    tag_selector?: { name: string; value: string }[]
+  }
+) =>
+  api.post(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary`, payload)
+
+export const getCanary = (type: string, name: string) =>
+  api.get<{ data: CanaryRelease }>(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary`).then(r => r.data.data)
+
+export const updateCanary = (
+  type: string, name: string,
+  payload: {
+    canary_detail: string
+    rollout_percent: number
+    version_constraint?: string
+    ip_selector?: string[]
+    tag_selector?: { name: string; value: string }[]
+  }
+) =>
+  api.put(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary`, payload)
+
+export const setCanaryPercent = (type: string, name: string, percent: number) =>
+  api.put(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary/percent`, { rollout_percent: percent })
+
+export const pauseCanary = (type: string, name: string) =>
+  api.post(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary/pause`)
+
+export const resumeCanary = (type: string, name: string) =>
+  api.post(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary/resume`)
+
+export const promoteCanary = (type: string, name: string) =>
+  api.post(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary/promote`)
+
+export const abortCanary = (type: string, name: string) =>
+  api.post(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary/abort`)
+
+export const getCanaryStats = (type: string, name: string) =>
+  api.get<{ data: CanaryStats }>(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary/stats`).then(r => r.data.data)
 

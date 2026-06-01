@@ -26,14 +26,18 @@
 package cache
 
 import (
+	"container/list"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alibaba/ilogtail/config_server/internal/model"
@@ -51,16 +55,52 @@ const (
 	prefixStatus   = "agent_status:"
 	pubSubChannel  = "configserver:invalidate"
 
+	// keyResolveCanaries is the fixed key used to cache the list of rolling
+	// canary releases inside the resolve cache.
+	keyResolveCanaries = "__canaries__"
+	// msgFlushResolve is published on the Pub/Sub channel to instruct peer
+	// replicas to clear their own resolve caches.
+	msgFlushResolve = "__flush_resolve__"
+
+	// resolveTTL is the TTL (seconds) for per-agent config-name entries in the
+	// resolve cache. Epoch-based invalidation handles correctness; TTL is just
+	// a backstop to reclaim memory for agents that stop heartbeating.
+	resolveTTL = 5 * 60 // 5 minutes
+
+	// resolveCanaryTTL is the TTL (seconds) for the active-canary list cached
+	// under keyResolveCanaries.  Any canary write also calls
+	// invalidateResolveCache, so this TTL acts only as a fallback safety net.
+	resolveCanaryTTL = 30 // 30 seconds
+
+	// resolveMaxMB is the maximum size of the dedicated resolve cache.
+	// Sizing is per-instance: in distributed mode each ConfigServer instance
+	// serves ~100 K agents, so 64 MB (≈ 188 K entries at ~340 B each) provides
+	// comfortable headroom for the epoch-transition overlap window where both
+	// old- and new-epoch entries coexist until the old ones expire via TTL.
+	// For larger per-instance agent counts, raise proportionally (~640 B/agent
+	// to account for the overlap window).
+	resolveMaxMB = 64
+
 	// agentRedisTTL is the TTL for agent entries stored in Redis (distributed mode).
 	// Each heartbeat refreshes the TTL, so entries expire 7 days after the last
 	// heartbeat, effectively acting as a "last-seen" registry across all replicas.
 	agentRedisTTL = 7 * 24 * time.Hour
 
 	// Agent in-memory cache limits.
-	// Designed for fleets up to 50 000 agents (≈ 200 MB at ~4 KB/agent).
-	// Entries whose last heartbeat is older than agentTTL are removed by the
-	// background GC goroutine launched by StartGC.
-	maxAgents    = 50_000
+	// maxAgents is a per-instance limit; in distributed mode (Redis enabled) the
+	// full agent registry lives in Redis and agents that overflow the local map
+	// are still accessible via GetAgent's Redis fallback path.  For fleets
+	// exceeding 100 K agents, run multiple ConfigServer instances (each handles
+	// ~100 K agents) behind a load balancer — do NOT raise maxAgents above a few
+	// hundred-thousand per instance or the in-memory footprint becomes untenable
+	// (~4 KB/agent × 1 M = 4 GB).
+	maxAgents = 100_000
+
+	// maxStatuses is the in-memory cap for config-delivery status entries.
+	// Each entry is ~250 B; 100 K agents × 10 configs = 1 M entries ≈ 250 MB.
+	// Entries exceeding the cap are silently dropped from memory but are still
+	// written to Redis in distributed mode, so the admin UI remains accurate.
+	maxStatuses  = maxAgents * 10
 	agentTTL     = 30 * time.Minute
 	agentGCEvery = 5 * time.Minute
 )
@@ -68,6 +108,16 @@ const (
 // IsNotFound reports whether err represents a "record not found" store error.
 func IsNotFound(err error) bool {
 	return errors.Is(err, gorm.ErrRecordNotFound)
+}
+
+// agentConfigSet is the value stored in the resolve cache per agent.
+// It holds only config names (no Detail bytes) so the cache stays small.
+// On a cache hit the full config content is hydrated from the existing
+// per-config L1/L2 cache entries.
+type agentConfigSet struct {
+	Pipeline []string `json:"p"`
+	Instance []string `json:"i"`
+	Onetime  []string `json:"o"`
 }
 
 // Manager wraps a store.Store with a two or three-tier cache. Agent data
@@ -82,9 +132,21 @@ type Manager struct {
 	l2TTL time.Duration
 	sf    singleflight.Group
 
+	// resolveCache holds per-agent config-name resolution results (agentConfigSet)
+	// keyed by [8-byte epoch LE][8-byte FNV-64a agent hash].  It is separate from
+	// l1 so that bumping resolveEpoch makes all current entries unreachable without
+	// a mass Clear(), letting them expire naturally via TTL and avoiding a
+	// thundering herd of DB queries after a structural write.
+	resolveCache *freecache.Cache
+	resolveEpoch atomic.Uint64 // incremented by invalidateResolveCache
+
 	// In-memory agent registry — never persisted to DB.
-	agentsMu  sync.RWMutex
-	agentsMap map[string]*model.Agent // key: instanceID
+	// agentsLRU/agentsLRUIdx provide O(1) eviction of the least-recently-seen
+	// agent when the map hits maxAgents capacity.
+	agentsMu     sync.RWMutex
+	agentsMap    map[string]*model.Agent  // key: instanceID
+	agentsLRU    *list.List               // front=newest, back=oldest (instanceID values)
+	agentsLRUIdx map[string]*list.Element // instanceID → list element
 
 	// In-memory agent config status — key: instanceID + "\x00" + configName + "\x00" + configType
 	statusesMu  sync.RWMutex
@@ -98,13 +160,16 @@ type Manager struct {
 // Call StartGC(ctx) after New to enable periodic eviction of stale agents.
 func New(st store.Store, rdb redis.UniversalClient, l1MaxMB int, l1TTL, l2TTL time.Duration) *Manager {
 	m := &Manager{
-		st:          st,
-		l1:          freecache.NewCache(l1MaxMB * 1024 * 1024),
-		rdb:         rdb,
-		l1TTL:       l1TTL,
-		l2TTL:       l2TTL,
-		agentsMap:   make(map[string]*model.Agent, maxAgents),
-		statusesMap: make(map[string]*model.AgentConfigStatus),
+		st:           st,
+		l1:           freecache.NewCache(l1MaxMB * 1024 * 1024),
+		rdb:          rdb,
+		l1TTL:        l1TTL,
+		l2TTL:        l2TTL,
+		resolveCache: freecache.NewCache(resolveMaxMB * 1024 * 1024),
+		agentsMap:    make(map[string]*model.Agent, maxAgents),
+		agentsLRU:    list.New(),
+		agentsLRUIdx: make(map[string]*list.Element, maxAgents),
+		statusesMap:  make(map[string]*model.AgentConfigStatus),
 	}
 	if rdb != nil {
 		ready := make(chan struct{})
@@ -303,23 +368,242 @@ func (m *Manager) subscribeInvalidations(ready chan struct{}) {
 	}
 	close(ready)
 	for msg := range sub.Channel() {
-		m.l1.Del([]byte(msg.Payload))
+		if msg.Payload == msgFlushResolve {
+			// A peer replica performed a structural write; bump the local epoch
+			// so our cached agent-resolution entries are superseded on next lookup.
+			// Also delete the shared canary-list entry so it is re-fetched fresh.
+			m.resolveEpoch.Add(1)
+			m.resolveCache.Del([]byte(keyResolveCanaries))
+		} else {
+			m.l1.Del([]byte(msg.Payload))
+		}
 	}
 }
 
-// ── Ensure Manager exposes the helper needed by agent_handler ──────────────────
+// ── Resolve-cache helpers ─────────────────────────────────────────────────────
 
-// GetConfigsForAgent is a direct pass-through to the underlying store;
-// the result set depends on the agent match context and cannot be meaningfully
-// cached at this layer without complex cache-key design.
+// resolveAgentKey returns a 16-byte cache key: the current resolve epoch
+// (8 bytes, little-endian) followed by the FNV-64a hash of the agent's match
+// attributes (IP, host identity, version, sorted tags).
+//
+// Embedding the epoch as a key prefix makes all entries from the previous epoch
+// unreachable as soon as resolveEpoch is incremented — entries then expire
+// naturally via TTL rather than being evicted by a mass Clear().
+func (m *Manager) resolveAgentKey(match model.AgentMatchContext) []byte {
+	h := fnv.New64a()
+	h.Write([]byte(match.IP))
+	h.Write([]byte{0})
+	if match.Hostid != "" {
+		h.Write([]byte(match.Hostid))
+	} else {
+		h.Write([]byte(match.Hostname))
+	}
+	h.Write([]byte{0})
+	h.Write([]byte(match.Version))
+	h.Write([]byte{0})
+	tags := make([]string, len(match.Tags))
+	for i, t := range match.Tags {
+		tags[i] = t.TagName + "=" + t.TagValue
+	}
+	sort.Strings(tags)
+	for _, t := range tags {
+		h.Write([]byte(t))
+		h.Write([]byte{0})
+	}
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:8], m.resolveEpoch.Load())
+	binary.LittleEndian.PutUint64(buf[8:16], h.Sum64())
+	return buf[:]
+}
+
+// invalidateResolveCache makes all current agent-resolution cache entries
+// unreachable by bumping resolveEpoch (their keys embed the previous epoch value).
+// It also explicitly deletes the shared canary-list entry so that the next
+// getActiveCanaries call fetches a fresh list from the DB.
+//
+// In distributed mode a msgFlushResolve message is published so that peer
+// replicas perform the same epoch bump on their own caches.
+//
+// Using an epoch bump instead of resolveCache.Clear() avoids a thundering herd:
+// agents re-populate the cache one by one over the next heartbeat cycle rather
+// than all missing simultaneously.
+func (m *Manager) invalidateResolveCache(ctx context.Context) {
+	m.resolveEpoch.Add(1)
+	m.resolveCache.Del([]byte(keyResolveCanaries))
+	if m.rdb != nil {
+		if err := m.rdb.Publish(ctx, pubSubChannel, msgFlushResolve).Err(); err != nil {
+			log.Printf("WARN: publish flush_resolve: %v", err)
+		}
+	}
+}
+
+// getActiveCanaries returns all CanaryRelease records with status "rolling".
+// The list is cached in resolveCache for resolveCanaryTTL seconds to avoid
+// a full-table scan on every heartbeat.  Any canary write also calls
+// invalidateResolveCache (which deletes the key), so staleness is bounded.
+//
+// The DB path is protected by singleflight so that a mass cache miss (e.g.
+// after a canary write clears the key) causes only one ListCanaries query
+// regardless of how many agent goroutines arrive simultaneously.
+func (m *Manager) getActiveCanaries(ctx context.Context) ([]*model.CanaryRelease, error) {
+	key := []byte(keyResolveCanaries)
+	if raw, err := m.resolveCache.Get(key); err == nil {
+		var crs []*model.CanaryRelease
+		if json.Unmarshal(raw, &crs) == nil {
+			return crs, nil
+		}
+	}
+	v, err, _ := m.sf.Do(keyResolveCanaries, func() (interface{}, error) {
+		all, err := m.st.ListCanaries(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var active []*model.CanaryRelease
+		for _, cr := range all {
+			if cr.Status == model.CanaryStatusRolling {
+				active = append(active, cr)
+			}
+		}
+		if raw, err := json.Marshal(active); err == nil {
+			_ = m.resolveCache.Set(key, raw, resolveCanaryTTL)
+		}
+		return active, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]*model.CanaryRelease), nil
+}
+
+// hydrateAgentConfigSet converts a cached agentConfigSet (names only) into full
+// PipelineConfig, InstanceConfig, and OnetimeCommand slices by fetching content
+// from the per-config L1/L2/DB cache.  It also applies any active canary overlays
+// for the given agent using pure CPU computation (no additional DB queries).
+//
+// If a config has been deleted since the names were cached, it is silently skipped;
+// the handler's deletion-signal logic will then instruct the agent to remove it.
+func (m *Manager) hydrateAgentConfigSet(ctx context.Context, aset agentConfigSet, match model.AgentMatchContext) ([]*model.PipelineConfig, []*model.InstanceConfig, []*model.OnetimeCommand, error) {
+	canaries, err := m.getActiveCanaries(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	crMap := make(map[string]*model.CanaryRelease, len(canaries))
+	for _, cr := range canaries {
+		crMap[cr.ConfigName+"\x00"+cr.ConfigType] = cr
+	}
+
+	pipes := make([]*model.PipelineConfig, 0, len(aset.Pipeline))
+	for _, name := range aset.Pipeline {
+		cfg, err := m.GetPipelineConfig(ctx, name)
+		if err != nil {
+			if IsNotFound(err) {
+				continue // deleted since names were cached; handler will send version=-1
+			}
+			return nil, nil, nil, err
+		}
+		if cr, ok := crMap[name+"\x00"+model.ConfigTypePipeline]; ok {
+			eligible, cerr := model.CanaryEligible(cr, match, name)
+			if cerr == nil && eligible {
+				// Copy to avoid mutating the cached config object held in L1/L2.
+				cp := *cfg
+				cp.Detail = cr.CanaryDetail
+				cp.Version = cr.CanaryVersion
+				cfg = &cp
+			}
+		}
+		pipes = append(pipes, cfg)
+	}
+
+	insts := make([]*model.InstanceConfig, 0, len(aset.Instance))
+	for _, name := range aset.Instance {
+		cfg, err := m.GetInstanceConfig(ctx, name)
+		if err != nil {
+			if IsNotFound(err) {
+				continue
+			}
+			return nil, nil, nil, err
+		}
+		if cr, ok := crMap[name+"\x00"+model.ConfigTypeInstance]; ok {
+			eligible, cerr := model.CanaryEligible(cr, match, name)
+			if cerr == nil && eligible {
+				cp := *cfg
+				cp.Detail = cr.CanaryDetail
+				cp.Version = cr.CanaryVersion
+				cfg = &cp
+			}
+		}
+		insts = append(insts, cfg)
+	}
+
+	onetimes := make([]*model.OnetimeCommand, 0, len(aset.Onetime))
+	for _, name := range aset.Onetime {
+		cmd, err := m.st.GetOnetimeCommand(ctx, name)
+		if err != nil {
+			if IsNotFound(err) {
+				continue
+			}
+			return nil, nil, nil, err
+		}
+		onetimes = append(onetimes, cmd)
+	}
+
+	return pipes, insts, onetimes, nil
+}
+
+// GetConfigsForAgent resolves which configs should be delivered to an agent.
+//
+// Results are cached in resolveCache keyed by a hash of the agent's matching
+// attributes (IP, host identity, version, tags).  Only the config names are
+// stored in the cache; config Detail bytes are fetched from the per-config
+// L1/L2/DB cache on a cache hit, keeping resolve-cache memory usage small.
+//
+// The cache is invalidated (via invalidateResolveCache) on any structural write
+// that could change which configs an agent receives.
 func (m *Manager) GetConfigsForAgent(ctx context.Context, match model.AgentMatchContext) ([]*model.PipelineConfig, []*model.InstanceConfig, []*model.OnetimeCommand, error) {
-	return m.st.GetConfigsForAgent(ctx, match)
+	key := m.resolveAgentKey(match)
+	if raw, err := m.resolveCache.Get(key); err == nil {
+		var aset agentConfigSet
+		if json.Unmarshal(raw, &aset) == nil {
+			return m.hydrateAgentConfigSet(ctx, aset, match)
+		}
+	}
+
+	// Cache miss: full DB resolution path.
+	pipes, insts, onetimes, err := m.st.GetConfigsForAgent(ctx, match)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Cache only the names — Detail bytes live in the per-config L1/L2 entries.
+	aset := agentConfigSet{
+		Pipeline: make([]string, len(pipes)),
+		Instance: make([]string, len(insts)),
+		Onetime:  make([]string, len(onetimes)),
+	}
+	for i, c := range pipes {
+		aset.Pipeline[i] = c.Name
+	}
+	for i, c := range insts {
+		aset.Instance[i] = c.Name
+	}
+	for i, c := range onetimes {
+		aset.Onetime[i] = c.Name
+	}
+	if raw, err := json.Marshal(aset); err == nil {
+		_ = m.resolveCache.Set(key, raw, resolveTTL)
+	}
+
+	return pipes, insts, onetimes, nil
 }
 
 // Convenience wrappers so the rest of the server only holds a *Manager.
 
 func (m *Manager) CreateGroup(ctx context.Context, g *model.AgentGroup) error {
-	return m.st.CreateGroup(ctx, g)
+	if err := m.st.CreateGroup(ctx, g); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
 }
 func (m *Manager) GetGroup(ctx context.Context, name string) (*model.AgentGroup, error) {
 	return m.st.GetGroup(ctx, name)
@@ -328,22 +612,42 @@ func (m *Manager) ListGroups(ctx context.Context) ([]*model.AgentGroup, error) {
 	return m.st.ListGroups(ctx)
 }
 func (m *Manager) UpdateGroup(ctx context.Context, g *model.AgentGroup) error {
-	return m.st.UpdateGroup(ctx, g)
+	if err := m.st.UpdateGroup(ctx, g); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
 }
 func (m *Manager) DeleteGroup(ctx context.Context, name string) error {
-	return m.st.DeleteGroup(ctx, name)
+	if err := m.st.DeleteGroup(ctx, name); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
 }
 func (m *Manager) SetGroupTags(ctx context.Context, groupName string, tags []*model.AgentGroupTag) error {
-	return m.st.SetGroupTags(ctx, groupName, tags)
+	if err := m.st.SetGroupTags(ctx, groupName, tags); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
 }
 func (m *Manager) GetGroupTags(ctx context.Context, groupName string) ([]*model.AgentGroupTag, error) {
 	return m.st.GetGroupTags(ctx, groupName)
 }
 func (m *Manager) AddGroupConfig(ctx context.Context, mapping *model.GroupConfigMapping) error {
-	return m.st.AddGroupConfig(ctx, mapping)
+	if err := m.st.AddGroupConfig(ctx, mapping); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
 }
 func (m *Manager) RemoveGroupConfig(ctx context.Context, groupName, configName, configType string) error {
-	return m.st.RemoveGroupConfig(ctx, groupName, configName, configType)
+	if err := m.st.RemoveGroupConfig(ctx, groupName, configName, configType); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
 }
 func (m *Manager) GetGroupConfigs(ctx context.Context, groupName string) ([]*model.GroupConfigMapping, error) {
 	return m.st.GetGroupConfigs(ctx, groupName)
@@ -371,6 +675,7 @@ func (m *Manager) DeletePipelineConfig(ctx context.Context, name string) error {
 		return err
 	}
 	m.InvalidatePipelineConfig(ctx, name)
+	m.invalidateResolveCache(ctx)
 	return nil
 }
 
@@ -396,6 +701,7 @@ func (m *Manager) DeleteInstanceConfig(ctx context.Context, name string) error {
 		return err
 	}
 	m.InvalidateInstanceConfig(ctx, name)
+	m.invalidateResolveCache(ctx)
 	return nil
 }
 
@@ -420,12 +726,19 @@ func agentStatusKey(instanceID, configName, configType string) string {
 
 func (m *Manager) UpsertAgent(ctx context.Context, agent *model.Agent) error {
 	m.agentsMu.Lock()
-	// Enforce capacity cap: if the map is full and this is a new agent (not a
-	// heartbeat update), evict the entry with the oldest heartbeat to make room.
-	if _, exists := m.agentsMap[agent.InstanceID]; !exists && len(m.agentsMap) >= maxAgents {
-		m.evictOldestAgentLocked()
+	if elem, exists := m.agentsLRUIdx[agent.InstanceID]; exists {
+		// Existing agent: refresh data and move to front (most-recently-seen).
+		m.agentsMap[agent.InstanceID] = agent
+		m.agentsLRU.MoveToFront(elem)
+	} else {
+		// New agent: enforce capacity cap before inserting.
+		if len(m.agentsMap) >= maxAgents {
+			m.evictOldestAgentLocked()
+		}
+		m.agentsMap[agent.InstanceID] = agent
+		elem := m.agentsLRU.PushFront(agent.InstanceID)
+		m.agentsLRUIdx[agent.InstanceID] = elem
 	}
-	m.agentsMap[agent.InstanceID] = agent
 	m.agentsMu.Unlock()
 
 	// In distributed mode, write to Redis so every admin/configserver replica
@@ -441,25 +754,30 @@ func (m *Manager) UpsertAgent(ctx context.Context, agent *model.Agent) error {
 	return nil
 }
 
-// evictOldestAgentLocked removes the agent with the earliest LastHeartbeat from
-// agentsMap and purges its entries from statusesMap.
+// evictOldestAgentLocked removes the least-recently-seen agent from agentsMap
+// in O(1) time using the LRU doubly-linked list (back = oldest).
+// It also purges that agent's entries from statusesMap.
 // Caller MUST hold agentsMu (write lock).
 func (m *Manager) evictOldestAgentLocked() {
-	var oldestID string
-	var oldestTime time.Time
-	for id, a := range m.agentsMap {
-		if oldestID == "" || a.LastHeartbeat.Before(oldestTime) {
-			oldestID = id
-			oldestTime = a.LastHeartbeat
-		}
-	}
-	if oldestID == "" {
+	back := m.agentsLRU.Back()
+	if back == nil {
 		return
 	}
-	delete(m.agentsMap, oldestID)
+	id := back.Value.(string)
+	m.agentsLRU.Remove(back)
+	delete(m.agentsLRUIdx, id)
+	a, ok := m.agentsMap[id]
+	if !ok {
+		return
+	}
+	delete(m.agentsMap, id)
+	var hbStr string
+	if a != nil {
+		hbStr = a.LastHeartbeat.Format(time.RFC3339)
+	}
 	log.Printf("WARN: agent cache full (%d); evicted oldest agent %q (last heartbeat: %s)",
-		maxAgents, oldestID, oldestTime.Format(time.RFC3339))
-	prefix := oldestID + "\x00"
+		maxAgents, id, hbStr)
+	prefix := id + "\x00"
 	m.statusesMu.Lock()
 	for k := range m.statusesMap {
 		if strings.HasPrefix(k, prefix) {
@@ -480,6 +798,10 @@ func (m *Manager) evictStaleAgents() {
 		if a.LastHeartbeat.Before(cutoff) {
 			stale = append(stale, id)
 			delete(m.agentsMap, id)
+			if elem, ok := m.agentsLRUIdx[id]; ok {
+				m.agentsLRU.Remove(elem)
+				delete(m.agentsLRUIdx, id)
+			}
 		}
 	}
 	m.agentsMu.Unlock()
@@ -686,7 +1008,13 @@ func (m *Manager) UpsertAgentConfigStatus(ctx context.Context, status *model.Age
 	status.UpdatedAt = time.Now()
 	key := agentStatusKey(status.InstanceID, status.ConfigName, status.ConfigType)
 	m.statusesMu.Lock()
-	m.statusesMap[key] = status
+	// Enforce cap: allow updates to existing keys; only drop genuinely new entries
+	// when the map is full.  Redis is still written below so the admin UI stays
+	// accurate in distributed mode even when the local cap is reached.
+	_, exists := m.statusesMap[key]
+	if exists || len(m.statusesMap) < maxStatuses {
+		m.statusesMap[key] = status
+	}
 	m.statusesMu.Unlock()
 
 	if m.rdb != nil {
@@ -870,4 +1198,40 @@ func (m *Manager) CreateAuditLog(ctx context.Context, entry *model.AuditLog) err
 
 func (m *Manager) ListAuditLogs(ctx context.Context, limit, offset int) ([]*model.AuditLog, int64, error) {
 	return m.st.ListAuditLogs(ctx, limit, offset)
+}
+
+// ── Canary releases ───────────────────────────────────────────────────────────
+// Canary writes also invalidate the resolve cache so that the new rollout
+// parameters take effect on the next heartbeat cycle.
+
+func (m *Manager) CreateCanary(ctx context.Context, cr *model.CanaryRelease) error {
+	if err := m.st.CreateCanary(ctx, cr); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
+}
+
+func (m *Manager) GetCanary(ctx context.Context, configName, configType string) (*model.CanaryRelease, error) {
+	return m.st.GetCanary(ctx, configName, configType)
+}
+
+func (m *Manager) ListCanaries(ctx context.Context) ([]*model.CanaryRelease, error) {
+	return m.st.ListCanaries(ctx)
+}
+
+func (m *Manager) UpdateCanary(ctx context.Context, cr *model.CanaryRelease) error {
+	if err := m.st.UpdateCanary(ctx, cr); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
+}
+
+func (m *Manager) DeleteCanary(ctx context.Context, configName, configType string) error {
+	if err := m.st.DeleteCanary(ctx, configName, configType); err != nil {
+		return err
+	}
+	m.invalidateResolveCache(ctx)
+	return nil
 }

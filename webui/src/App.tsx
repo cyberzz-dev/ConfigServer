@@ -19,6 +19,7 @@ import {
   SunOutlined,
   MoonOutlined,
   DesktopOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons'
 import ConfigsPage from './pages/ConfigsPage'
 import GroupsPage from './pages/GroupsPage'
@@ -27,6 +28,7 @@ import UsersPage from './pages/UsersPage'
 import RolesPage from './pages/RolesPage'
 import AuditPage from './pages/AuditPage'
 import LoginPage from './pages/LoginPage'
+import CanaryPage from './pages/CanaryPage'
 import { getAuthStatus, logout, changePassword, getMe } from './api'
 import { PermissionProvider, useCurrentUser, useLoadMe } from './PermissionContext'
 
@@ -40,6 +42,7 @@ const NAV_GROUPS = [
       { path: '/pipeline-configs',  label: 'Pipeline Configs',  icon: <DatabaseOutlined /> },
       { path: '/instance-configs',  label: 'Instance Configs',  icon: <ToolOutlined /> },
       { path: '/onetime-configs',    label: 'Onetime Commands',    icon: <ThunderboltOutlined /> },
+      { path: '/canary',            label: 'Canary Releases',   icon: <ExperimentOutlined /> },
     ],
   },
   {
@@ -65,6 +68,7 @@ const BREADCRUMB_MAP: Record<string, string[]> = {
   '/pipeline-configs':  ['Collection', 'Pipeline Configs'],
   '/instance-configs':  ['Collection', 'Instance Configs'],
   '/onetime-configs':   ['Collection', 'Onetime Commands'],
+  '/canary':            ['Collection', 'Canary Releases'],
   '/agent-groups':      ['Management', 'Agent Groups'],
   '/agents':            ['Management', 'Agents'],
   '/users':             ['System', 'User Management'],
@@ -348,6 +352,7 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
                 <Route path="/onetime-configs"   element={<ConfigsPage tab="onetime" />} />
                 <Route path="/agent-groups"       element={<GroupsPage />} />
                 <Route path="/agents"            element={<AgentsPage />} />
+                <Route path="/canary"            element={<CanaryPage />} />
                 <Route path="/users"             element={<UsersPage />} />
                 <Route path="/roles"             element={<RolesPage />} />
                 <Route path="/audit"             element={<AuditPage />} />

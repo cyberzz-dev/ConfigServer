@@ -9,10 +9,11 @@ import type { AgentGroup, GroupTag, GroupConfigMapping, Config, OnetimeCommand, 
 import {
   listGroups, createGroup, updateGroup, deleteGroup,
   getGroupTags, setGroupTags,
-  getGroupIPSelector, setGroupIPSelector, deleteGroupIPSelector,
+  getGroupIPSelector, setGroupIPSelector,
+  setGroupVersionConstraint,
   getGroupConfigs, addGroupConfig, removeGroupConfig,
   listPipelineConfigs, listInstanceConfigs, listOnetimeCommands,
-  listConfigHistory, rollbackConfig, listDeletedConfigs,
+  listConfigHistory, rollbackConfig, listDeletedConfigs, getGroup,
 } from '../api'
 import { useResizableColumns, tableComponents } from '../components/ResizableColumns'
 import { usePermission } from '../PermissionContext'
@@ -104,6 +105,7 @@ export default function GroupsPage() {
   const [tags, setTags] = useState<GroupTag[]>([])
   const [ipSelectorGroup, setIPSelectorGroup] = useState<AgentGroup | null>(null)
   const [ipSelectorLines, setIPSelectorLines] = useState<string[]>([])
+  const [versionConstraintGroup, setVersionConstraintGroup] = useState<AgentGroup | null>(null)
   const [configsGroup, setConfigsGroup] = useState<AgentGroup | null>(null)
   const [configs, setConfigs] = useState<GroupConfigMapping[]>([])
   const [addConfigOpen, setAddConfigOpen] = useState(false)
@@ -132,6 +134,7 @@ export default function GroupsPage() {
   const [form] = Form.useForm()
   const [tagsForm] = Form.useForm()
   const [ipSelectorForm] = Form.useForm()
+  const [vcForm] = Form.useForm()
   const canCreate = usePermission('agent_groups', 'create')
   const canUpdate = usePermission('agent_groups', 'update')
   const canDelete = usePermission('agent_groups', 'delete')
@@ -266,6 +269,9 @@ export default function GroupsPage() {
       } else if (item.action === 'set_ip_selector') {
         const current = await getGroupIPSelector(historyTarget!)
         setDiffCurrentStr(current.ips.join('\n'))
+      } else if (item.action === 'set_version_constraint') {
+        const current = await getGroup(historyTarget!)
+        setDiffCurrentStr(current.VersionConstraint ?? '')
       } else {
         // add_config / remove_config — fetch current config list
         const current = await getGroupConfigs(historyTarget!)
@@ -300,8 +306,21 @@ export default function GroupsPage() {
     tagsForm.setFieldsValue({ tags: t.map(x => `${x.TagName}=${x.TagValue}`).join('\n') })
   }
 
-  const openIPSelector = async (g: AgentGroup) => {
-    let ips = parseIPSelectorLines(g.IPSelectorJSON)
+  const openVersionConstraint = (g: AgentGroup) => {
+    setVersionConstraintGroup(g)
+    vcForm.setFieldsValue({ versionConstraint: g.VersionConstraint })
+  }
+
+  const handleSaveVersionConstraint = async () => {
+    const { versionConstraint } = await vcForm.validateFields()
+    await setGroupVersionConstraint(versionConstraintGroup!.Name, versionConstraint ?? '')
+    message.success('Version constraint saved')
+    const name = versionConstraintGroup!.Name
+    setVersionConstraintGroup(null)
+    refresh()
+  }
+
+  const openIPSelector = async (g: AgentGroup) => {    let ips = parseIPSelectorLines(g.IPSelectorJSON)
     try {
       const selector = await getGroupIPSelector(g.Name)
       ips = selector.ips
@@ -321,14 +340,6 @@ export default function GroupsPage() {
     const name = ipSelectorGroup!.Name
     setIPSelectorGroup(null)
     setGroupMeta(prev => ({ ...prev, [name]: { ...prev[name], ipSelectorCount: ips.length } }))
-  }
-
-  const handleClearIPSelector = async () => {
-    await deleteGroupIPSelector(ipSelectorGroup!.Name)
-    message.success('IP selector cleared')
-    const name = ipSelectorGroup!.Name
-    setIPSelectorGroup(null)
-    setGroupMeta(prev => ({ ...prev, [name]: { ...prev[name], ipSelectorCount: 0 } }))
   }
 
   const handleSaveTags = async () => {
@@ -421,9 +432,15 @@ export default function GroupsPage() {
           </Button>
           <Button size="small" onClick={() => openIPSelector(record)}
             style={groupMeta[record.Name]?.ipSelectorCount
-              ? { borderColor: '#13c2c2', color: '#13c2c2' }
+              ? { borderColor: '#fa8c16', color: '#d46b08', background: 'rgba(250, 140, 22, 0.14)' }
               : { color: '#bfbfbf', borderColor: '#d9d9d9' }}>
             {`IPs (${String(groupMeta[record.Name]?.ipSelectorCount ?? '\u2026').padEnd(2, '\u00A0')})`}
+          </Button>
+          <Button size="small" onClick={() => openVersionConstraint(record)}
+            style={record.VersionConstraint
+              ? { borderColor: '#722ed1', color: '#722ed1' }
+              : { color: '#bfbfbf', borderColor: '#d9d9d9' }}>
+            {record.VersionConstraint ? `Ver: ${record.VersionConstraint}` : 'Version'}
           </Button>
           <Button size="small" onClick={() => openConfigs(record)}
             style={groupMeta[record.Name]?.configCount
@@ -507,7 +524,6 @@ export default function GroupsPage() {
         onOk={handleSaveIPSelector}
         onCancel={() => setIPSelectorGroup(null)}
         footer={[
-          <Button key="clear" danger onClick={handleClearIPSelector} disabled={!ipSelectorLines.length}>Clear</Button>,
           <Button key="cancel" onClick={() => setIPSelectorGroup(null)}>Cancel</Button>,
           <Button key="save" type="primary" onClick={handleSaveIPSelector}>Save</Button>,
         ]}
@@ -525,8 +541,24 @@ export default function GroupsPage() {
         </div>
       </Modal>
 
-      {/* Group configs modal */}
+      {/* Version constraint modal */}
       <Modal
+        title={`Version Constraint for "${versionConstraintGroup?.Name}"`}
+        open={!!versionConstraintGroup}
+        onOk={handleSaveVersionConstraint}
+        onCancel={() => setVersionConstraintGroup(null)}
+      >
+        <p style={{ marginTop: 0 }}>
+          Format: <code>&gt;= 1.8.0, &lt; 2.0.0</code> (AND), or use <code>||</code> for OR groups: <code>&gt;= 1.0.0, &lt; 2.0.0 || &gt;= 3.0.0</code>. Leave empty to match all versions.
+        </p>
+        <Form form={vcForm} layout="vertical">
+          <Form.Item name="versionConstraint">
+            <Input placeholder="e.g. >= 1.8.0, < 2.0.0" allowClear />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* Group configs modal */}      <Modal
         title={`Configs for "${configsGroup?.Name}"`}
         open={!!configsGroup}
         footer={null}
@@ -627,12 +659,13 @@ export default function GroupsPage() {
           dataSource={historyList}
           locale={{ emptyText: 'No history yet' }}
           renderItem={item => {
-            const canRollback = item.action === 'set_tags' || item.action === 'set_ip_selector' || item.action === 'add_config' || item.action === 'remove_config' || item.action === 'delete'
+            const canRollback = item.action === 'set_tags' || item.action === 'set_ip_selector' || item.action === 'set_version_constraint' || item.action === 'add_config' || item.action === 'remove_config' || item.action === 'delete'
             const tagColor = item.action === 'delete' ? 'red'
               : item.action === 'create' ? 'green'
               : item.action === 'rollback' ? 'purple'
               : item.action === 'set_tags' ? 'geekblue'
               : item.action === 'set_ip_selector' ? 'teal'
+              : item.action === 'set_version_constraint' ? 'volcano'
               : item.action === 'add_config' ? 'cyan'
               : item.action === 'remove_config' ? 'orange'
               : 'blue'
@@ -677,6 +710,10 @@ export default function GroupsPage() {
           const lines = diffCurrentStr.split('\n').filter(Boolean)
           afterStr = [...lines, diffEntry.detail].sort().join('\n')
           diffLines = computeDiff(beforeStr, afterStr)
+        } else if (diffEntry.action === 'set_version_constraint') {
+          beforeStr = diffCurrentStr
+          afterStr = diffEntry.detail ?? ''
+          diffLines = computeDiff(beforeStr, afterStr)
         } else {
           // delete rollback = recreate group; show snapshot as all-additions
           beforeStr = ''
@@ -688,6 +725,8 @@ export default function GroupsPage() {
           ? 'Rollback Preview — Tags'
           : diffEntry.action === 'set_ip_selector'
             ? 'Rollback Preview — IP Selector'
+          : diffEntry.action === 'set_version_constraint'
+            ? 'Rollback Preview — Version Constraint'
           : diffEntry.action === 'add_config'
             ? `Rollback Preview — Remove config "${diffEntry.detail}"`
             : diffEntry.action === 'remove_config'
