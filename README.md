@@ -46,6 +46,28 @@ LoongCollector 的配置管理服务，提供 Agent 配置下发、WebUI 管理�
 
 ![Onetime Commands](images/collection-onetime.png)
 
+### 金丝雀发布（Canary Release）
+
+**金丝雀发布列表**
+
+![金丝雀发布列表](images/collection-Canary-Releases.png)
+
+**创建金丝雀发布**
+
+![创建金丝雀发布](images/collection-Canary-Releases-create.png)
+
+**金丝雀发布详情**
+
+![金丝雀发布详情](images/collection-Canary-Releases-details.png)
+
+**编辑金丝雀发布**
+
+![编辑金丝雀发布](images/collection-Canary-Releases-edit.png)
+
+**调整灰度比例**
+
+![调整灰度比例](images/collection-Canary-Releases-adjust-rollout.png)
+
 ### Agent 管理
 
 **Agent 信息**
@@ -95,6 +117,7 @@ LoongCollector 的配置管理服务，提供 Agent 配置下发、WebUI 管理�
 - [配置历史与回滚](#配置历史与回滚)
 - [一次性命令（Onetime Commands）](#一次性命令onetime-commands)
 - [基于 IP 组的配置下发](#基于-ip-组的配置下发)
+- [金丝雀发布（Canary Release）](#金丝雀发布canary-release)
 - [REST API 参考](#rest-api-参考)
 - [故障排查](#故障排查)
 
@@ -582,6 +605,99 @@ curl -X PUT http://localhost:8081/api/v1/groups/app_group1/configs/pipeline/ngin
 
 ---
 
+## 金丝雀发布（Canary Release）
+
+> 金丝雀发布用于将**新版本配置**逐步下发给部分 Agent，在全量推送前验证配置正确性，降低变更风险。
+
+### 核心概念
+
+| 概念 | 说明 |
+|------|------|
+| **Config Name** | 关联的 Pipeline 或 Instance 配置名称 |
+| **Canary Detail** | 金丝雀版本的配置内容（YAML），与正式配置并行存在 |
+| **Rollout %** | 灰度比例（0–100），决定有多少比例的 Agent 收到金丝雀版本 |
+| **Tag Selector** | 额外的标签过滤器（ANY 匹配），只有携带指定标签的 Agent 才参与灰度 |
+| **IP Selector** | IP 段过滤器，只有 IP 在范围内的 Agent 才参与灰度 |
+
+### 灰度路由逻辑
+
+ Agent 心跳到达 configserver 时，针对每条金丝雀发布按如下顺序决策：
+
+```
+Agent 心跳
+    │
+    ├─ Tag Selector 为空 或 Agent 标签 ANY 匹配？
+    │       否 → 下发稳定版本
+    │
+    ├─ IP Selector 为空 或 Agent IP 在范围内？
+    │       否 → 下发稳定版本
+    │
+    ├─ 计算 Bucket = FNV32a(hostid + "\0" + configName) % 100
+    │       Bucket >= Rollout% → 下发稳定版本
+    │
+    └─ Bucket < Rollout% → 下发金丝雀版本（Canary Detail）
+```
+
+**Bucket 稳定性**：同一主机对同一配置的 Bucket 值固定不变（基于 `host.id` 或 `hostname`），保证同一台机器不会在灰度期间反复切换版本。
+
+### 创建金丝雀发布
+
+```bash
+curl -X POST http://localhost:8081/api/v1/canary-releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "config_name": "nginx-access-log",
+    "config_type": "pipeline",
+    "canary_detail": "inputs:\n  - Type: input_file\n    FilePaths: [\"/var/log/nginx/*.log\"]\n    MaxSendRate: 20",
+    "rollout_percent": 10,
+    "tag_selector": "{\"tags\":[{\"name\":\"env\",\"value\":\"staging\"}]}"
+  }'
+```
+
+字段说明：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `config_name` | string | ✓ | 关联的配置名称 |
+| `config_type` | string | ✓ | `pipeline` 或 `instance` |
+| `canary_detail` | string | ✓ | 金丝雀版本配置内容（YAML） |
+| `rollout_percent` | int | ✓ | 灰度比例，0–100 |
+| `tag_selector` | string | - | JSON 格式的标签选择器，空表示不限制 |
+| `ip_selector` | string | - | IP 段规则（与分组 IP 选择器格式相同），空表示不限制 |
+
+### 调整灰度比例
+
+```bash
+# 将灰度比例从 10% 扩大到 50%
+curl -X PATCH http://localhost:8081/api/v1/canary-releases/nginx-access-log/rollout \
+  -H 'Content-Type: application/json' \
+  -d '{"rollout_percent": 50}'
+```
+
+### 全量 / 中止金丝雀
+
+```bash
+# 全量发布：将金丝雀内容写入正式配置，并删除金丝雀记录
+curl -X POST http://localhost:8081/api/v1/canary-releases/nginx-access-log/promote
+
+# 中止灰度：删除金丝雀发布，所有 Agent 恢复接收稳定版本
+curl -X DELETE http://localhost:8081/api/v1/canary-releases/nginx-access-log
+```
+
+### 查看差异（Diff）
+
+WebUI 详情页内置 DiffViewer，可直观对比**当前稳定版本**与**金丝雀版本**的配置差异。
+
+### 配置下发优先级
+
+当同一配置同时存在普通分组下发和金丝雀发布时，优先级为：
+
+```
+金丝雀版本（命中灰度条件）> 分组配置 > 默认配置
+```
+
+---
+
 ## REST API 参考
 
 Admin API 基础路径：`http://<admin-host>:8081`。所有写操作接口需携带有效 session cookie（先调用 `/api/v1/auth/login` 获取）。
@@ -640,6 +756,19 @@ Admin API 基础路径：`http://<admin-host>:8081`。所有写操作接口需�
 | GET | `/api/v1/history/{type}/{name}` | 获取资源变更历史（`type`: pipeline \| instance \| group \| onetime） |
 | GET | `/api/v1/deleted-history/{type}` | 获取已删除资源列表（回收站） |
 | POST | `/api/v1/history/{type}/{name}/{id}/rollback` | 回滚到指定历史版本 |
+
+### 金丝雀发布
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/canary-releases` | 列出所有金丝雀发布 |
+| POST | `/api/v1/canary-releases` | 创建金丝雀发布 |
+| GET | `/api/v1/canary-releases/{configName}` | 获取指定金丝雀发布 |
+| PUT | `/api/v1/canary-releases/{configName}` | 更新金丝雀发布 |
+| PATCH | `/api/v1/canary-releases/{configName}/rollout` | 仅调整灰度比例 |
+| POST | `/api/v1/canary-releases/{configName}/promote` | 全量发布（金丝雀 → 正式） |
+| DELETE | `/api/v1/canary-releases/{configName}` | 中止并删除金丝雀发布 |
+| GET | `/api/v1/canary-releases/{configName}/diff` | 获取稳定版本与金丝雀版本的 diff |
 
 ### Agent 信息（只读）
 
