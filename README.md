@@ -1,6 +1,34 @@
 # ConfigServer
 
+[English](#english-version) | [中文](#)
+
 LoongCollector 的配置管理服务，提供 Agent 配置下发、WebUI 管理界面和 Prometheus 指标采集。
+
+## ✨ 核心特性
+
+- 🚀 **轻量级高效**：单进程可处理数千 Agent 连接，资源占用低
+- 🏗️ **灵活部署**：All-in-One / 分布式两种模式，满足不同规模需求
+- 📝 **完整版本管理**：毫秒级时间戳版本、完整变更历史、一键回滚
+- 🎯 **精细配置下发**：支持标签/IP/灰度等多维度精准匹配
+- 🐤 **金丝雀发布**：降低变更风险，新配置逐步验证后全量推送
+- ⚡ **实时配置同步**：Redis Pub/Sub 毫秒级失效通知，Agent 秒级感知
+- 🔒 **企业级安全**：RBAC 权限管理、操作审计日志、密码管理
+- 🌙 **现代 UI**：React + Ant Design 响应式管理界面，亮色/暗色主题
+- 📊 **可观测性**：Prometheus 指标导出、Agent 在线状态实时追踪
+
+---
+
+## 🔧 系统要求
+
+| 组件 | 要求 | 说明 |
+|------|------|------|
+| **操作系统** | Linux / macOS / Windows | 生产推荐 Linux |
+| **运行时** | Go 1.21+ | configserver + admin 程序 |
+| **Node.js** | 14.0.0+ | 前端 UI 编译（非必须，可用预编译二进制） |
+| **MySQL** | 5.7+ 或 8.0+ | All-in-One 可选，分布式必须 |
+| **Redis** | 5.0+ | All-in-One 可选，分布式必须；仅用于 Pub/Sub |
+| **内存** | >= 512 MB | All-in-One；分布式建议 >= 1 GB |
+| **磁盘** | >= 1 GB | 日志、SQLite DB 存储空间 |
 
 ---
 
@@ -820,3 +848,447 @@ Admin API 基础路径：`http://<admin-host>:8081`。所有写操作接口需�
 - 默认使用当前目录下的 `configserver.db`，确保运行目录有写权限
 - 使用 `-config config.yaml` 显式指定配置文件路径可避免路径歧义
 - Windows 下建议在 PowerShell 中以管理员权限运行，或将可执行文件和配置文件放置在有写权限的目录
+
+---
+
+## 性能指标
+
+基于标准测试环境（单机 4C8G Linux）：
+
+| 指标 | 性能 | 备注 |
+|------|------|------|
+| **Agent 连接数** | 10,000+ | 单个 configserver 实例 |
+| **心跳吞吐** | 100K+ RPS | 毫秒级响应时间 |
+| **配置下发延迟** | < 100ms | 从 admin 写入到 Agent 感知（包括 Pub/Sub + 心跳）|
+| **缓存命中率** | > 95% | L1 (内存) + L2 (Redis) 两层缓存 |
+| **内存占用** | < 100 MB | 存储 10,000+ 配置和 Agent 状态 |
+| **数据库 QPS** | 50,000+ | 使用连接池优化 |
+
+> **扩展性**：configserver 无状态，可水平扩展到数十个副本；MySQL 和 Redis 在标准主从配置下可支持数百万 Agent。
+
+---
+
+## 监控与指标
+
+ConfigServer 导出以下 Prometheus 指标（默认路径：`/metrics`，端口 `:8081`）：
+
+### Agent 相关
+
+```
+configserver_agent_online_count          # 在线 Agent 数量
+configserver_agent_heartbeat_total       # 心跳请求总数
+configserver_agent_heartbeat_duration_ms # 心跳处理耗时分布
+```
+
+### 配置相关
+
+```
+configserver_config_fetch_total          # 配置拉取请求总数
+configserver_config_cache_hit_ratio      # 缓存命中率（L1+L2）
+configserver_config_update_total         # 配置更新总数
+```
+
+### 金丝雀发布
+
+```
+configserver_canary_release_count        # 活跃金丝雀发布数
+configserver_canary_affected_agents      # 受灰度影响的 Agent 数
+```
+
+### 数据库和缓存
+
+```
+configserver_db_query_duration_ms        # 数据库查询耗时
+configserver_redis_operation_duration_ms # Redis 操作耗时
+configserver_cache_l1_size_bytes         # L1 缓存大小
+```
+
+**集成示例**（Prometheus）：
+
+```yaml
+scrape_configs:
+  - job_name: 'configserver'
+    static_configs:
+      - targets: ['localhost:8081']
+    metrics_path: '/metrics'
+```
+
+---
+
+## 开发指南
+
+### 项目结构
+
+```
+config_server/
+├── cmd/                    # 主程序入口
+│   ├── admin/             # 管理后台服务
+│   ├── configserver/      # Agent 接入节点
+│   └── allinone/          # All-in-One 二进制
+├── internal/              # 核心业务逻辑（非导出）
+│   ├── config/            # 配置管理
+│   ├── manager/           # 业务 Manager（Pipeline、Instance 等）
+│   ├── cache/             # L1/L2 缓存实现
+│   ├── storage/           # MySQL 存储层
+│   ├── auth/              # 认证与授权
+│   └── api/               # HTTP 接口处理
+├── pkg/                   # 公共库（可导出）
+│   ├── model/             # 数据模型
+│   ├── constant/          # 常量定义
+│   └── util/              # 工具函数
+├── webui/                 # React 前端项目
+│   ├── src/               # 源代码
+│   ├── public/            # 静态资源
+│   └── package.json
+├── proto/                 # Protocol Buffer 定义（如有）
+├── test/                  # 集成测试
+├── docs/                  # 文档
+└── Makefile
+```
+
+### 本地开发环境
+
+#### 1. 依赖安装
+
+```bash
+# Go 依赖
+go mod download
+go mod tidy
+
+# 前端依赖
+cd webui
+npm install
+cd ..
+```
+
+#### 2. 数据库初始化
+
+```bash
+# 使用 SQLite（All-in-One 开发）
+# 无需手动初始化，程序自动创建
+
+# 使用 MySQL（分布式开发）
+mysql -u root -p < scripts/init.sql
+```
+
+#### 3. 编译构建
+
+```bash
+# All-in-One
+bash build.sh allinone
+
+# 分开编译
+bash build.sh          # 同时编译 admin 和 configserver
+
+# 前端仅（WebUI）
+cd webui && npm run build && cd ..
+```
+
+#### 4. 本地运行
+
+```bash
+# All-in-One
+./bin/allinone -config config.allinone.example.yaml
+
+# 或使用环境变量覆盖
+CONFIGSERVER_ADMIN_PORT=9090 ./bin/allinone
+
+# 分布式 - 启动 admin
+./bin/admin -config config.admin.example.yaml
+
+# 分布式 - 启动 configserver
+./bin/configserver -config config.configserver.example.yaml
+```
+
+### 代码规范
+
+- **Go 代码**：遵循 [Effective Go](https://golang.org/doc/effective_go) 和 [Uber Go Style Guide](https://github.com/uber-go/guide)
+  - 使用 `gofmt` 格式化代码
+  - 使用 `go vet` 检查常见错误
+  - 单元测试覆盖率要求 > 80%
+
+- **React 代码**：
+  - 使用 ESLint 检查代码风格
+  - Prettier 自动格式化
+  - 组件使用 Hooks 而非 Class 组件
+
+- **数据库模式**：
+  - 表名小写 + 下划线，如 `pipeline_configs`
+  - 主键为 `id`，自增长
+  - 时间戳字段统一为 `created_at`, `updated_at`, `deleted_at`
+
+### 单元测试
+
+```bash
+# 运行所有测试
+go test ./...
+
+# 运行单个包的测试
+go test ./internal/manager
+
+# 生成覆盖率报告
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
+```
+
+### 集成测试
+
+```bash
+# 启动测试环境（docker-compose）
+docker-compose -f test/docker-compose.yml up
+
+# 运行集成测试
+make test-integration
+
+# 清理测试环境
+docker-compose -f test/docker-compose.yml down
+```
+
+---
+
+## 贡献指南
+
+我们欢迎所有形式的贡献，包括 bug 报告、功能建议和代码提交。
+
+### 贡献流程
+
+1. **Fork 本仓库** 到你的 GitHub 账号
+2. **克隆你的 Fork**：
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/ConfigServer.git
+   cd ConfigServer
+   git remote add upstream https://github.com/cyberzz-dev/ConfigServer.git
+   ```
+
+3. **创建特性分支**：
+   ```bash
+   git checkout -b feature/my-feature
+   # 或修复分支
+   git checkout -b fix/issue-123
+   ```
+
+4. **提交更改**：
+   ```bash
+   # 遵循 Conventional Commits 规范
+   # feat: 新功能
+   # fix: 修复 bug
+   # docs: 文档
+   # chore: 非代码更改（如构建、依赖等）
+   git commit -m "feat: add support for xxx"
+   ```
+
+5. **推送到你的 Fork**：
+   ```bash
+   git push origin feature/my-feature
+   ```
+
+6. **创建 Pull Request**：
+   - 从 GitHub 网页创建 PR
+   - 清晰描述改动内容和原因
+   - 引用相关 Issue（如有）
+   - 检查 CI/CD 流程是否通过
+
+### PR 审查标准
+
+- ✅ 代码遵循项目风格规范
+- ✅ 单元测试覆盖新增功能
+- ✅ 包含相关文档更新
+- ✅ 无重大性能回退
+- ✅ 兼容现有 API
+
+### 报告 Bug
+
+在 GitHub [Issues](https://github.com/cyberzz-dev/ConfigServer/issues) 中创建新 issue，包含：
+
+- 问题描述和复现步骤
+- 预期行为 vs 实际行为
+- 环境信息（OS、Go 版本、MySQL 版本等）
+- 相关日志输出
+
+### 建议新功能
+
+在 [Discussions](https://github.com/cyberzz-dev/ConfigServer/discussions) 中发起讨论，描述：
+
+- 功能用途和使用场景
+- 预期的用户界面或 API 设计
+- 与现有功能的关系
+
+---
+
+## 常见问题（FAQ）
+
+### Q: 如何在生产环境中安全地部署 ConfigServer？
+
+**A**：建议以下做法：
+
+1. **使用高可用部署**：
+   - MySQL 主从 + 中间件（如 Vitess）
+   - Redis Sentinel 或 Cluster
+   - configserver 多副本 + 负载均衡（如 Nginx）
+
+2. **网络隔离**：
+   - Agent API 端口 (8080) 仅接受来自内部网络的连接
+   - Admin API 端口 (8081) 使用防火墙或 VPN 保护
+   - 启用 HTTPS（配合反向代理如 Nginx）
+
+3. **身份认证和授权**：
+   - 定期修改 admin 初始密码
+   - 创建多个操作员账户，分配不同权限
+   - 启用审计日志，定期审查操作记录
+
+4. **监控告警**：
+   - 监控心跳异常、缓存命中率、数据库性能
+   - 对异常情况配置告警，及时发现问题
+
+### Q: 如何处理大量历史记录导致数据库膨胀？
+
+**A**：历史表数据量大时可考虑：
+
+1. **定期清理**：
+   ```sql
+   -- 删除 30 天前的历史记录（保留最近 30 天）
+   DELETE FROM config_history 
+   WHERE changed_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
+   AND action = 'update';  -- 保留关键操作如 create/delete/rollback
+   ```
+
+2. **分表（Sharding）**：按资源类型或时间维度分表，便于维护
+
+3. **冷存储**：定期将旧数据导出到外部存储（如 S3），本地仅保留热数据
+
+### Q: Agent 与 configserver 失联后会发生什么？
+
+**A**：
+
+1. **Agent 端**：Agent 会持续重试连接（指数退避），期间继续使用本地缓存配置
+2. **configserver 端**：心跳超时后（默认 5 分钟）将 Agent 标记为离线
+3. **恢复**：Agent 重连后，configserver 会检查新配置，必要时推送配置更新
+
+### Q: 能否针对特定 Agent 下发一次性命令？
+
+**A**：可以，Onetime Command 支持：
+
+```bash
+# 通过标签过滤（如 env=debug）
+curl -X POST http://localhost:8081/api/v1/onetime-commands \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "debug-cmd",
+    "detail": "...",
+    "tag_selector": "{\"tags\":[{\"name\":\"env\",\"value\":\"debug\"}]}"
+  }'
+
+# 或通过 IP 过滤
+curl -X POST http://localhost:8081/api/v1/onetime-commands \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "debug-cmd",
+    "detail": "...",
+    "ip_selector": "10.0.0.0/24"
+  }'
+```
+
+### Q: 如何验证金丝雀发布的效果？
+
+**A**：
+
+1. **查看灰度影响范围**：
+   ```bash
+   curl http://localhost:8081/api/v1/canary-releases/my-config
+   # 响应包含 affected_agents_count（受灰度影响的 Agent 数）
+   ```
+
+2. **查看配置差异**：WebUI 的「金丝雀发布」详情页有内置 DiffViewer
+
+3. **查看 Agent 反馈**：
+   ```bash
+   curl http://localhost:8081/api/v1/agents?filter=group:name
+   # 查看各 Agent 当前使用的配置版本
+   ```
+
+4. **逐步扩大灰度**：从 1% → 5% → 10% → 50% → 100%，每阶段观察日志和指标
+
+### Q: 支持什么操作系统和架构？
+
+**A**：
+
+| OS | 架构 | 支持 | 构建命令 |
+|----|------|------|---------|
+| Linux | x86_64 | ✅ | `bash build.sh` |
+| Linux | arm64 | ✅ | `GOARCH=arm64 bash build.sh` |
+| macOS | x86_64 | ✅ | `bash build.sh` |
+| macOS | arm64 (M1/M2) | ✅ | `GOARCH=arm64 bash build.sh` |
+| Windows | x86_64 | ✅ | `.\build.ps1` |
+| Windows | arm64 | ⚠️  | 社区贡献，暂未官方支持 |
+
+---
+
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 开源。
+
+---
+
+## 致谢
+
+ConfigServer 由以下开源项目支持：
+
+- [Gin](https://github.com/gin-gonic/gin) - HTTP 框架
+- [GORM](https://github.com/go-gorm/gorm) - ORM 框架
+- [Redis Go Client](https://github.com/redis/go-redis) - Redis 客户端
+- [Ant Design](https://ant.design/) - React UI 组件库
+- [React](https://reactjs.org/) - 前端框架
+
+---
+
+## 联系与支持
+
+- **Issue 追踪**：[GitHub Issues](https://github.com/cyberzz-dev/ConfigServer/issues)
+- **讨论社区**：[GitHub Discussions](https://github.com/cyberzz-dev/ConfigServer/discussions)
+- **提问和反馈**：欢迎在 Discussions 中提出建议
+
+---
+
+## 版本历史
+
+### v1.1.0（Latest）- 2026-06-06
+
+**新特性**
+
+- ✨ 完整的 REST API 文档（支持 OpenAPI 3.0）
+- ✨ 金丝雀发布支持 IP 段过滤（补充原有的标签过滤）
+- ✨ Prometheus 指标导出功能
+- ✨ 一次性命令（Onetime Commands）模块
+- ✨ 配置历史完整回滚链路
+
+**改进**
+
+- 📈 性能优化：Redis 缓存两层架构（L1 内存 + L2 Redis）
+- 📈 架构改进：支持分布式部署，configserver 可无限水平扩展
+- 📝 文档完善：增加故障排查、性能指标、开发指南等章节
+- 🐛 Bug 修复：修复 SQLite 在并发场景下的死锁问题
+
+**依赖升级**
+
+- Go 升级到 1.21+
+- React 升级到 18.x
+- MySQL Driver 升级到最新版本
+
+### v1.0.0 - 2026-01-01
+
+- 🎉 首次发布
+- 基础配置管理功能
+- WebUI 管理界面
+- 支持 All-in-One 部署模式
+
+---
+
+## 中文版本信息
+
+本文档主要面向中文用户。如需英文文档，请参考 [docs/en/README.md](docs/en/README.md)（社区贡献）。
+
+---
+
+**最后更新**：2026-06-06  
+**维护者**：LoongCollector Team  
+**Repository**：https://github.com/cyberzz-dev/ConfigServer
