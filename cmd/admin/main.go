@@ -51,12 +51,12 @@ func main() {
 	}
 
 	rdb := redis.NewUniversalClient(&redis.UniversalOptions{
-		Addrs:    []string{cfg.RedisAddr},
+		Addrs:    cfg.RedisAddrs,
 		Password: cfg.RedisPassword,
 		DB:       cfg.RedisDB,
 	})
 
-	mgr := cache.New(st, rdb, cfg.L1MaxSizeMB, cfg.L1TTL, cfg.L2TTL)
+	mgr := cache.New(st, rdb, cfg.L1MaxSizeMB, cfg.L1TTL, cfg.L2TTL, cfg.RedisHFE)
 
 	mc := metrics.New(mgr, cfg.MetricsOnlineWindow)
 
@@ -66,7 +66,7 @@ func main() {
 		log.Fatalf("embed fs: %v", err)
 	}
 
-	adminSrv := adminserver.NewAdminServer(cfg.AdminAddr(), mgr, webFS, mc.Handler())
+	adminSrv := adminserver.NewAdminServer(cfg.AdminAddr(), mgr, webFS, mc.Handler(), cfg.SMTP)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

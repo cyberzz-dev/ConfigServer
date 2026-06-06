@@ -86,6 +86,13 @@ const (
 	// heartbeat, effectively acting as a "last-seen" registry across all replicas.
 	agentRedisTTL = 7 * 24 * time.Hour
 
+	// agentHashSafetyTTL is the hash-key-level safety-net TTL used when HFE is
+	// enabled (Valkey 9.0+ / Redis 7.4+).  Individual fields expire at
+	// agentRedisTTL via HEXPIRE; this longer key-level TTL ensures the hash is
+	// eventually reclaimed even if some fields were written without a field TTL
+	// (e.g. by an older replica during a rolling upgrade).
+	agentHashSafetyTTL = agentRedisTTL * 2
+
 	// Agent in-memory cache limits.
 	// maxAgents is a per-instance limit; in distributed mode (Redis enabled) the
 	// full agent registry lives in Redis and agents that overflow the local map
@@ -125,12 +132,13 @@ type agentConfigSet struct {
 // additionally mirrored to Redis in distributed mode so the admin process can
 // expose a fleet-wide view.
 type Manager struct {
-	st    store.Store
-	l1    *freecache.Cache
-	rdb   redis.UniversalClient // nil ⇒ All-in-One (no Redis)
-	l1TTL time.Duration
-	l2TTL time.Duration
-	sf    singleflight.Group
+	st         store.Store
+	l1         *freecache.Cache
+	rdb        redis.UniversalClient // nil ⇒ All-in-One (no Redis)
+	l1TTL      time.Duration
+	l2TTL      time.Duration
+	sf         singleflight.Group
+	hfeEnabled bool // use HEXPIRE for per-field TTL (Valkey 9.0+ / Redis 7.4+)
 
 	// resolveCache holds per-agent config-name resolution results (agentConfigSet)
 	// keyed by [8-byte epoch LE][8-byte FNV-64a agent hash].  It is separate from
@@ -148,23 +156,27 @@ type Manager struct {
 	agentsLRU    *list.List               // front=newest, back=oldest (instanceID values)
 	agentsLRUIdx map[string]*list.Element // instanceID → list element
 
-	// In-memory agent config status — key: instanceID + "\x00" + configName + "\x00" + configType
+	// In-memory agent config status — key: instanceID + ":" + configName + ":" + configType
 	statusesMu  sync.RWMutex
 	statusesMap map[string]*model.AgentConfigStatus
 }
 
 // New creates a Manager.
-//   - rdb == nil  → All-in-One mode (L1 + L3 only)
-//   - rdb != nil  → full three-tier mode with Pub/Sub cache invalidation
+//   - rdb == nil       → All-in-One mode (L1 + L3 only)
+//   - rdb != nil       → full three-tier mode with Pub/Sub cache invalidation
+//   - hfeEnabled=true  → use HEXPIRE for per-field TTL on agent config-status
+//     hashes (requires Valkey 9.0+ or Redis 7.4+);
+//     ignored when rdb is nil.
 //
 // Call StartGC(ctx) after New to enable periodic eviction of stale agents.
-func New(st store.Store, rdb redis.UniversalClient, l1MaxMB int, l1TTL, l2TTL time.Duration) *Manager {
+func New(st store.Store, rdb redis.UniversalClient, l1MaxMB int, l1TTL, l2TTL time.Duration, hfeEnabled bool) *Manager {
 	m := &Manager{
 		st:           st,
 		l1:           freecache.NewCache(l1MaxMB * 1024 * 1024),
 		rdb:          rdb,
 		l1TTL:        l1TTL,
 		l2TTL:        l2TTL,
+		hfeEnabled:   hfeEnabled && rdb != nil,
 		resolveCache: freecache.NewCache(resolveMaxMB * 1024 * 1024),
 		agentsMap:    make(map[string]*model.Agent, maxAgents),
 		agentsLRU:    list.New(),
@@ -503,7 +515,9 @@ func (m *Manager) hydrateAgentConfigSet(ctx context.Context, aset agentConfigSet
 		}
 		if cr, ok := crMap[name+"\x00"+model.ConfigTypePipeline]; ok {
 			eligible, cerr := model.CanaryEligible(cr, match, name)
-			if cerr == nil && eligible {
+			if cerr != nil {
+				log.Printf("WARN: canary eligibility check failed for pipeline %q agent %s: %v", name, match.IP, cerr)
+			} else if eligible {
 				// Copy to avoid mutating the cached config object held in L1/L2.
 				cp := *cfg
 				cp.Detail = cr.CanaryDetail
@@ -525,7 +539,9 @@ func (m *Manager) hydrateAgentConfigSet(ctx context.Context, aset agentConfigSet
 		}
 		if cr, ok := crMap[name+"\x00"+model.ConfigTypeInstance]; ok {
 			eligible, cerr := model.CanaryEligible(cr, match, name)
-			if cerr == nil && eligible {
+			if cerr != nil {
+				log.Printf("WARN: canary eligibility check failed for instance %q agent %s: %v", name, match.IP, cerr)
+			} else if eligible {
 				cp := *cfg
 				cp.Detail = cr.CanaryDetail
 				cp.Version = cr.CanaryVersion
@@ -593,7 +609,10 @@ func (m *Manager) GetConfigsForAgent(ctx context.Context, match model.AgentMatch
 		_ = m.resolveCache.Set(key, raw, resolveTTL)
 	}
 
-	return pipes, insts, onetimes, nil
+	// Apply canary overlays on the cache-miss path too, so every delivery path
+	// goes through hydrateAgentConfigSet regardless of whether the resolve cache
+	// was cold or warm.
+	return m.hydrateAgentConfigSet(ctx, aset, match)
 }
 
 // Convenience wrappers so the rest of the server only holds a *Manager.
@@ -720,8 +739,20 @@ func (m *Manager) DeleteOnetimeCommand(ctx context.Context, name string) error {
 
 // ── In-memory agent storage (resets on restart) ─────────────────────────────
 
+// agentStatusKey returns the in-memory map key for a single config status entry.
 func agentStatusKey(instanceID, configName, configType string) string {
-	return instanceID + "\x00" + configName + "\x00" + configType
+	return instanceID + ":" + configName + ":" + configType
+}
+
+// agentHashKey returns the Redis Hash key that stores all config statuses for
+// one agent. Using a Hash reduces key count from N_agents×N_configs to N_agents.
+func agentHashKey(instanceID string) string {
+	return prefixStatus + instanceID
+}
+
+// agentHashField returns the Hash field name for a single config status entry.
+func agentHashField(configName, configType string) string {
+	return configName + ":" + configType
 }
 
 func (m *Manager) UpsertAgent(ctx context.Context, agent *model.Agent) error {
@@ -788,7 +819,7 @@ func (m *Manager) evictOldestAgentLocked() {
 }
 
 // evictStaleAgents removes all agents whose LastHeartbeat is older than agentTTL
-// and purges their config-status entries.
+// and purges their config-status entries from both memory and Redis.
 func (m *Manager) evictStaleAgents() {
 	cutoff := time.Now().Add(-agentTTL)
 
@@ -810,9 +841,10 @@ func (m *Manager) evictStaleAgents() {
 		return
 	}
 
+	// Clean up in-memory status map
 	m.statusesMu.Lock()
 	for _, id := range stale {
-		prefix := id + "\x00"
+		prefix := id + ":"
 		for k := range m.statusesMap {
 			if strings.HasPrefix(k, prefix) {
 				delete(m.statusesMap, k)
@@ -821,7 +853,24 @@ func (m *Manager) evictStaleAgents() {
 	}
 	m.statusesMu.Unlock()
 
-	log.Printf("agent GC: evicted %d stale agents (TTL=%s)", len(stale), agentTTL)
+	// Clean up Redis entries (distributed mode only).
+	// Each agent's entire status Hash is a single key, so one DEL per agent suffices.
+	if m.rdb != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		delKeys := make([]string, 0, len(stale)*2)
+		for _, id := range stale {
+			delKeys = append(delKeys, prefixAgent+id, agentHashKey(id))
+		}
+		if err := m.rdb.Del(ctx, delKeys...).Err(); err != nil {
+			log.Printf("WARN: agent GC redis del: %v", err)
+		}
+		log.Printf("agent GC: evicted %d stale agents, deleted %d Redis keys (TTL=%s)",
+			len(stale), len(delKeys), agentTTL)
+	} else {
+		log.Printf("agent GC: evicted %d stale agents (TTL=%s)", len(stale), agentTTL)
+	}
 }
 
 func (m *Manager) GetAgent(ctx context.Context, instanceID string) (*model.Agent, error) {
@@ -1019,8 +1068,35 @@ func (m *Manager) UpsertAgentConfigStatus(ctx context.Context, status *model.Age
 
 	if m.rdb != nil {
 		if raw, err := json.Marshal(status); err == nil {
-			if err := m.rdb.Set(ctx, prefixStatus+key, raw, agentRedisTTL).Err(); err != nil {
-				log.Printf("WARN: write agent config status to redis %s: %v", key, err)
+			hashKey := agentHashKey(status.InstanceID)
+			field := agentHashField(status.ConfigName, status.ConfigType)
+			if m.hfeEnabled {
+				// HFE mode (Valkey 9.0+ / Redis 7.4+): set a per-field TTL via
+				// HEXPIRE so each config-status entry expires independently.
+				// Fields that stop being reported (e.g. a config removed from the
+				// agent) expire at agentRedisTTL from their last update without
+				// being kept alive by heartbeats for other configs in the same hash.
+				// The hash-key TTL (agentHashSafetyTTL) is a safety net that is
+				// also refreshed on every write; it reclaims the key in the
+				// unlikely case where some fields were written without HEXPIRE
+				// (e.g. by an older replica during a rolling upgrade).
+				pipe := m.rdb.Pipeline()
+				pipe.HSet(ctx, hashKey, field, raw)
+				pipe.HExpire(ctx, hashKey, agentRedisTTL, field)
+				pipe.Expire(ctx, hashKey, agentHashSafetyTTL)
+				if _, err := pipe.Exec(ctx); err != nil {
+					log.Printf("WARN: write agent config status (hfe) to redis %s/%s: %v", hashKey, field, err)
+				}
+			} else {
+				// Standard mode: a single TTL covers the entire hash; it is
+				// refreshed on every field write so the hash survives as long as
+				// any config is being reported by the agent.
+				pipe := m.rdb.Pipeline()
+				pipe.HSet(ctx, hashKey, field, raw)
+				pipe.Expire(ctx, hashKey, agentRedisTTL)
+				if _, err := pipe.Exec(ctx); err != nil {
+					log.Printf("WARN: write agent config status to redis %s/%s: %v", hashKey, field, err)
+				}
 			}
 		}
 	}
@@ -1029,9 +1105,21 @@ func (m *Manager) UpsertAgentConfigStatus(ctx context.Context, status *model.Age
 
 func (m *Manager) GetAgentConfigStatuses(ctx context.Context, instanceID string) ([]*model.AgentConfigStatus, error) {
 	if m.rdb != nil {
-		return m.listAgentConfigStatusesFromRedis(ctx, instanceID)
+		// Single HGETALL fetches all config statuses for this agent in one round-trip.
+		fields, err := m.rdb.HGetAll(ctx, agentHashKey(instanceID)).Result()
+		if err != nil {
+			return nil, err
+		}
+		out := make([]*model.AgentConfigStatus, 0, len(fields))
+		for _, raw := range fields {
+			var s model.AgentConfigStatus
+			if err := json.Unmarshal([]byte(raw), &s); err == nil {
+				out = append(out, &s)
+			}
+		}
+		return out, nil
 	}
-	prefix := instanceID + "\x00"
+	prefix := instanceID + ":"
 	m.statusesMu.RLock()
 	var out []*model.AgentConfigStatus
 	for k, s := range m.statusesMap {
@@ -1045,7 +1133,7 @@ func (m *Manager) GetAgentConfigStatuses(ctx context.Context, instanceID string)
 
 func (m *Manager) ListAgentConfigStatuses(ctx context.Context) ([]*model.AgentConfigStatus, error) {
 	if m.rdb != nil {
-		return m.listAgentConfigStatusesFromRedis(ctx, "")
+		return m.listAgentConfigStatusesFromRedis(ctx)
 	}
 	m.statusesMu.RLock()
 	out := make([]*model.AgentConfigStatus, 0, len(m.statusesMap))
@@ -1056,37 +1144,49 @@ func (m *Manager) ListAgentConfigStatuses(ctx context.Context) ([]*model.AgentCo
 	return out, nil
 }
 
-func (m *Manager) listAgentConfigStatusesFromRedis(ctx context.Context, instanceID string) ([]*model.AgentConfigStatus, error) {
+func (m *Manager) listAgentConfigStatusesFromRedis(ctx context.Context) ([]*model.AgentConfigStatus, error) {
+	// Collect all agent Hash keys via SCAN, then pipeline HGETALL for each.
+	// Pattern matches agent_status:{instanceID} (one key per agent).
 	pattern := prefixStatus + "*"
-	if instanceID != "" {
-		pattern = prefixStatus + instanceID + "\x00*"
-	}
-	var statuses []*model.AgentConfigStatus
+
+	var hashKeys []string
 	var cursor uint64
 	for {
 		keys, nextCursor, err := m.rdb.Scan(ctx, cursor, pattern, 200).Result()
 		if err != nil {
 			return nil, err
 		}
-		if len(keys) > 0 {
-			vals, err := m.rdb.MGet(ctx, keys...).Result()
-			if err != nil {
-				return nil, err
-			}
-			for _, v := range vals {
-				if v == nil {
-					continue
-				}
-				var status model.AgentConfigStatus
-				if err := json.Unmarshal([]byte(v.(string)), &status); err != nil {
-					continue
-				}
-				statuses = append(statuses, &status)
-			}
-		}
+		hashKeys = append(hashKeys, keys...)
 		cursor = nextCursor
 		if cursor == 0 {
 			break
+		}
+	}
+	if len(hashKeys) == 0 {
+		return nil, nil
+	}
+
+	// Pipeline all HGETALL calls to minimise round-trips.
+	pipe := m.rdb.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(hashKeys))
+	for i, k := range hashKeys {
+		cmds[i] = pipe.HGetAll(ctx, k)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	var statuses []*model.AgentConfigStatus
+	for _, cmd := range cmds {
+		fields, err := cmd.Result()
+		if err != nil {
+			continue
+		}
+		for _, raw := range fields {
+			var s model.AgentConfigStatus
+			if err := json.Unmarshal([]byte(raw), &s); err == nil {
+				statuses = append(statuses, &s)
+			}
 		}
 	}
 	return statuses, nil

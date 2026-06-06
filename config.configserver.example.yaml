@@ -11,13 +11,16 @@
 # ============================================================
 
 # ── Database ─────────────────────────────────────────────────
-# Distributed mode requires MySQL.
+# Distributed mode requires MySQL or PostgreSQL.
 database:
   driver: mysql
   # MySQL DSN format:
   #   user:password@tcp(host:port)/dbname?param=value
   dsn: "configserver:s3cr3t@tcp(mysql:3306)/configserver?charset=utf8mb4&parseTime=True&loc=Local"
-  # Connection pool (applies to both SQLite and MySQL)
+  # PostgreSQL (16+) example — switch driver to "postgres" and update DSN:
+  # driver: postgres
+  # dsn: "host=postgres port=5432 user=configserver password=s3cr3t dbname=configserver sslmode=disable TimeZone=UTC"
+  # Connection pool (applies to both MySQL and PostgreSQL)
   pool:
     max_open_conns:    25    # max concurrent connections
     max_idle_conns:    10    # idle connections to keep open
@@ -26,9 +29,20 @@ database:
 # ── Redis ─────────────────────────────────────────────────────
 # Required for L2 cache and pub/sub invalidation with the admin process.
 redis:
-  addr: "redis:6379"   # host:port; Redis Cluster: comma-separated list
+  # Standalone / Sentinel mode: single address.
+  addr: "redis:6379"
+  # Redis Cluster mode: use addrs (YAML list) instead of addr.
+  # When addrs contains more than one entry the client automatically
+  # operates in cluster mode; the db field is ignored by the cluster.
+  # addrs:
+  #   - "redis-node1:6379"
+  #   - "redis-node2:6379"
+  #   - "redis-node3:6379"
   password: ""          # Redis AUTH password; empty = no auth
-  db: 0                 # Redis logical database index (0–15)
+  db: 0                 # Redis logical database index (0–15); ignored in cluster mode
+  # hfe: true           # Hash Field Expiry — requires Valkey 9.0+ or Redis 7.4+.
+  #                     # When enabled each config-status field gets its own TTL
+  #                     # (HEXPIRE) so stale per-config entries expire independently.
 
 # ── In-process cache (L1 freecache) ──────────────────────────
 cache:
@@ -56,3 +70,16 @@ metrics:
   push_url: ""                 # e.g. "http://vmagent:8429/api/v1/import/prometheus"
   push_interval: 30s
   online_window: 5m            # Agents silent longer than this are counted as offline
+
+# ── SMTP (optional) — password-reset emails ─────────────────────
+# ConfigServer mode does not serve the admin UI, so password-reset
+# emails are typically only needed in the admin process.
+# This section is provided for completeness.
+smtp:
+  host: ""
+  port: 587
+  username: ""
+  password: ""
+  from: "noreply@example.com"
+  tls: false
+  public_url: ""

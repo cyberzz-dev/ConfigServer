@@ -59,10 +59,15 @@ const theme = {
   },
 }
 
-createRoot(document.getElementById('root')!).render(
+const root = createRoot(document.getElementById('root')!)
+
+root.render(
   <StrictMode>
     <ConfigProvider theme={theme}>
       <App />
     </ConfigProvider>
   </StrictMode>,
 )
+
+// Splash removal is triggered by 'app:ready' event dispatched from App component
+// (fallback timeout is also set in index.html for resilience)

@@ -122,7 +122,7 @@ function PermissionPanel({ roleName }: { roleName: string }) {
 
 export default function RolesPage() {
   const [roles, setRoles]           = useState<Role[]>([])
-  const [loading, setLoading]       = useState(false)
+  const [loading, setLoading]       = useState(true)
   const [createOpen, setCreateOpen] = useState(false)
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Role | null>(null)

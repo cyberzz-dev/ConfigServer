@@ -43,14 +43,41 @@ export const getAuthStatus = () =>
 export const initAdmin = (password: string, confirm_password: string) =>
   api.post('/auth/init', { password, confirm_password })
 
+export interface LoginResponse {
+  username?: string
+  is_admin?: boolean
+  otp_required?: boolean
+  pending_token?: string
+}
+
 export const login = (username: string, password: string) =>
-  api.post<{ data: { username: string; is_admin: boolean } }>('/auth/login', { username, password })
+  api.post<{ data: LoginResponse }>('/auth/login', { username, password })
+
+export const loginOTP = (pending_token: string, otp_code: string) =>
+  api.post<{ data: { username: string; is_admin: boolean } }>('/auth/login/otp', { pending_token, otp_code })
 
 export const logout = () =>
   api.post('/auth/logout')
 
 export const changePassword = (current_password: string, new_password: string, confirm_password: string) =>
   api.post('/auth/change-password', { current_password, new_password, confirm_password })
+
+// ── TOTP / Two-Factor Auth ────────────────────────────────────────────────────
+
+export interface OTPSetupResponse {
+  provisioning_uri: string
+  secret: string
+  qr_code: string  // data:image/png;base64,...
+}
+
+export const otpSetup = () =>
+  api.post<{ data: OTPSetupResponse }>('/auth/otp/setup').then(r => r.data.data)
+
+export const otpEnable = (otp_code: string) =>
+  api.post('/auth/otp/enable', { otp_code })
+
+export const otpDisable = (password: string) =>
+  api.post('/auth/otp/disable', { current_password: password })
 
 // ── Current user ──────────────────────────────────────────────────────────────
 
@@ -153,14 +180,26 @@ export interface GroupConfigMapping {
   ConfigType: string
 }
 
+export interface AgentTag {
+  name: string
+  value: string
+}
+
 export interface Agent {
   InstanceID: string
   AgentType: string
   IP: string
   Hostname: string
+  Hostid?: string
   Version: string
+  TagsJSON?: string
   RunningStatus: string
   LastHeartbeat: string
+}
+
+export function parseAgentTags(agent: Agent): AgentTag[] {
+  if (!agent.TagsJSON) return []
+  try { return JSON.parse(agent.TagsJSON) } catch { return [] }
 }
 
 // Pipeline configs
@@ -319,10 +358,11 @@ export interface CanaryStats {
   config_type: string
   rollout_percent: number
   status: string
-  canary_hosts: number
-  stable_hosts: number
-  unknown_hosts: number
-  total_hosts: number
+  canary_agents: number
+  stable_agents: number
+  not_targeted: number   // fail IP/tag/version filter; outside canary scope
+  unknown_agents: number
+  total_agents: number
 }
 
 export const listCanaries = () =>
@@ -372,4 +412,17 @@ export const abortCanary = (type: string, name: string) =>
 
 export const getCanaryStats = (type: string, name: string) =>
   api.get<{ data: CanaryStats }>(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary/stats`).then(r => r.data.data)
+
+export interface CanaryAgent {
+  instance_id: string
+  agent_type: string
+  ip: string
+  hostname: string
+  version: string
+  tags: AgentTag[]
+  bucket: 'canary' | 'stable' | 'not_targeted' | 'unknown'
+}
+
+export const getCanaryAgents = (type: string, name: string) =>
+  api.get<{ data: CanaryAgent[] }>(`/configs/${encodeURIComponent(type)}/${encodeURIComponent(name)}/canary/agents`).then(r => r.data.data ?? [])
 

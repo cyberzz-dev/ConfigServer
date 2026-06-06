@@ -8,6 +8,9 @@
   --bg-container: #ffffff;
   --bg-elevated: #fafafa;
   --border-color: #d9d9d9;
+  --brand-word-1: #1677ff;
+  --brand-word-2: #fa8c16;
+  --brand-word-3: #13a8a8;
   --text-primary: #000000d9;
   --text-secondary: #434343;
   --text-tertiary: #8c8c8c;
@@ -29,6 +32,9 @@
   --bg-container: #292a2d;
   --bg-elevated: #35363a;
   --border-color: #3c4043;
+  --brand-word-1: #8ab4f8;
+  --brand-word-2: #ffb86b;
+  --brand-word-3: #66d9d9;
   --text-primary: #e8eaed;
   --text-secondary: #9aa0a6;
   --text-tertiary: #9aa0a6;
@@ -99,6 +105,40 @@ body {
   color: var(--text-primary);
 }
 
+.brand-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32em;
+}
+
+.brand-title-word-1 {
+  color: var(--brand-word-1);
+}
+
+.brand-title-word-2 {
+  color: var(--brand-word-2);
+}
+
+.brand-title-word-3 {
+  color: var(--brand-word-3);
+}
+
+/* ── Page transition ─────────────────────────────────────────────────────── */
+@keyframes page-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.page-transition {
+  animation: page-fade-in 0.8s ease-out;
+}
+
 /* ── Page header ──────────────────────────────────────────────────────────── */
 .page-header {
   margin-bottom: 16px;
@@ -142,7 +182,14 @@ body {
 .ant-table table {
   table-layout: fixed !important;
 }
-
+/* Kill all transitions/animations on every table cell — prevents sort-column
+   background-flash that appears as a hairline between rows on sort click.   */
+.ant-table-thead > tr > th,
+.ant-table-thead > tr > td,
+.ant-table-tbody > tr > td {
+  transition: none !important;
+  animation: none !important;
+}
 .ant-table-thead > tr > th {
   font-weight: 700 !important;
   font-size: 13px !important;
@@ -156,7 +203,7 @@ body {
 }
 .ant-table-thead > tr:last-child > th,
 .ant-table-thead > tr:last-child > td {
-  border-bottom: 2px solid var(--border-color) !important;
+  border-bottom: 1px solid var(--border-color) !important;
 }
 .ant-table-tbody > tr > td {
   font-size: 13px;
@@ -177,8 +224,11 @@ body {
   background: var(--table-row-hover) !important;
 }
 /* Ant Design tints the active sorted-column's cells with its own background.
-   Reset to transparent so our row-level stripe/hover/selection shows through. */
-.ant-table-tbody > tr > td.ant-table-column-sort {
+   Reset to transparent so our row-level stripe/hover/selection shows through.
+   Cover every possible state to prevent any background leaking through.      */
+.ant-table-tbody > tr > td.ant-table-column-sort,
+.ant-table-tbody > tr:hover > td.ant-table-column-sort,
+.ant-table-tbody > tr > td.ant-table-column-sort.ant-table-cell-row-hover {
   background: transparent !important;
 }
 .ant-table-cell-scrollbar {
@@ -209,27 +259,23 @@ body {
 }
 
 /* Selected row highlight — light theme */
-[data-theme="light"] .ant-table-tbody > tr.row-selected,
 [data-theme="light"] .ant-table-tbody > tr.row-selected > td {
   background: #e6f4ff !important;
-  border-top: 2px solid #1677ff !important;
-  border-bottom: 2px solid #1677ff !important;
+  box-shadow: inset 0 1px 0 #1677ff, inset 0 -1px 0 #1677ff;
 }
-[data-theme="light"] .ant-table-tbody > tr.row-selected:hover,
 [data-theme="light"] .ant-table-tbody > tr.row-selected:hover > td {
   background: #bae0ff !important;
+  box-shadow: inset 0 1px 0 #1677ff, inset 0 -1px 0 #1677ff;
 }
 
 /* Selected row highlight — dark theme */
-[data-theme="dark"] .ant-table-tbody > tr.row-selected,
 [data-theme="dark"] .ant-table-tbody > tr.row-selected > td {
   background: #1e3a5f !important;
-  border-top: 2px solid #8ab4f8 !important;
-  border-bottom: 2px solid #8ab4f8 !important;
+  box-shadow: inset 0 1px 0 #8ab4f8, inset 0 -1px 0 #8ab4f8;
 }
-[data-theme="dark"] .ant-table-tbody > tr.row-selected:hover,
 [data-theme="dark"] .ant-table-tbody > tr.row-selected:hover > td {
   background: #254a75 !important;
+  box-shadow: inset 0 1px 0 #8ab4f8, inset 0 -1px 0 #8ab4f8;
 }
 
 /* ── Config-type Tag colors ──────────────────────────────────────────────── */
@@ -243,6 +289,15 @@ body {
 [data-theme="light"] .type-instance { color: #531dab; background: #f9f0ff; border-color: #d3adf7; }
 [data-theme="light"] .type-onetime  { color: #d46b08; background: #fff7e6; border-color: #ffd591; }
 [data-theme="light"] .type-unknown  { color: #595959; background: #fafafa; border-color: #d9d9d9; }
+
+/* ── Default Ant Design Tag — dark mode override ─────────────────────────── */
+/* Ant Design's default Tag is near-invisible in dark mode (very pale grey).  */
+/* These rules apply to all plain <Tag> not using a custom className.         */
+[data-theme="dark"] .ant-tag {
+  color: #c8cdd4 !important;
+  background: #3a3d42 !important;
+  border-color: #5f6368 !important;
+}
 
 /* ── Tag colors ──────────────────────────────────────────────────────────── */
 /* dark theme */

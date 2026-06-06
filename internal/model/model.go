@@ -41,11 +41,12 @@ type AgentGroup struct {
 }
 
 type AgentMatchContext struct {
-	IP       string
-	Hostid   string // machine-stable ID (OTel host.id); does not change across restarts
-	Hostname string // fallback when Hostid is empty
-	Version  string
-	Tags     []AgentGroupTag
+	InstanceID string // unique per agent process
+	IP         string
+	Hostid     string // machine-stable ID (OTel host.id); does not change across restarts
+	Hostname   string // fallback when Hostid is empty
+	Version    string
+	Tags       []AgentGroupTag
 }
 
 type AgentGroupIPSelector struct {
@@ -175,11 +176,11 @@ type CanaryRelease struct {
 	// IPSelectorJSON optionally restricts the canary to agents whose IP matches.
 	// Same format as AgentGroup.IPSelectorJSON: {"ips":["10.0.0.1","10.1.0.0/16","10.2.0.1-10"]}.
 	// Empty string means no IP restriction.
-	IPSelectorJSON string `gorm:"type:text;not null;default:''"`
+	IPSelectorJSON string `gorm:"type:varchar(8192);not null;default:''"`
 	// TagSelectorJSON optionally restricts the canary to agents carrying at least
 	// one of the listed tags (ANY-match). Format: {"tags":[{"name":"env","value":"canary"}]}.
 	// Empty string means no tag restriction.
-	TagSelectorJSON string `gorm:"type:text;not null;default:''"`
+	TagSelectorJSON string `gorm:"type:varchar(8192);not null;default:''"`
 	Status          string `gorm:"not null;default:'rolling'"` // rolling|paused|promoted|aborted
 	CreatedBy       string `gorm:"not null;default:''"`
 	CreatedAt       time.Time
@@ -195,8 +196,15 @@ type User struct {
 	PasswordHash string `gorm:"not null"`
 	IsAdmin      bool   `gorm:"not null;default:false"`
 	// RoleName is empty when the user has no role assigned.
-	RoleName  string `gorm:"not null;default:''"`
-	UpdatedAt time.Time
+	RoleName string `gorm:"not null;default:''"`
+	// Email is used for password-reset emails. Empty = feature disabled for this user.
+	Email string `gorm:"not null;default:''"`
+	// TOTPSecret holds the base32-encoded TOTP secret key.
+	// Empty when OTP is not set up.
+	TOTPSecret string `gorm:"not null;default:''"`
+	// TOTPEnabled is true when the user has successfully verified their TOTP device.
+	TOTPEnabled bool `gorm:"not null;default:false"`
+	UpdatedAt   time.Time
 }
 
 // Role is a named permission template that can be shared across many users.

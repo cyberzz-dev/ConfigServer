@@ -3,7 +3,7 @@ import { Table, Tag, Typography, Button, Descriptions, Spin, Input, Space, Toolt
 import { ReloadOutlined, SearchOutlined, QuestionCircleOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import type { Agent, AgentConfigStatus } from '../api'
-import { listAgents, getAgentDetail } from '../api'
+import { listAgents, getAgentDetail, parseAgentTags } from '../api'
 import { useResizableColumns, tableComponents } from '../components/ResizableColumns'
 
 const { Text } = Typography
@@ -111,7 +111,7 @@ function ConfigStatusTable({ instanceID }: { instanceID: string }) {
 
 export default function AgentsPage() {
   const [agents, setAgents] = useState<Agent[]>([])
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [selectedRow, setSelectedRow] = useState<string | undefined>()
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
@@ -157,6 +157,23 @@ export default function AgentsPage() {
     { title: 'Last Heartbeat', dataIndex: 'LastHeartbeat', key: 'LastHeartbeat', width: 170,
       sorter: (a: Agent, b: Agent) => a.LastHeartbeat.localeCompare(b.LastHeartbeat),
       render: (v: string) => dayjs(v).format('YYYY-MM-DD HH:mm:ss') },
+    { title: 'Tags', key: 'Tags', width: 240,
+      render: (_: unknown, record: Agent) => {
+        const tags = parseAgentTags(record)
+        if (tags.length === 0) return <Text type="secondary" style={{ fontSize: 12 }}>—</Text>
+        return (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, maxWidth: 220 }}>
+            {tags.map(t => (
+              <Tag key={t.name} style={{ margin: 0, fontSize: 11, maxWidth: '100%' }}>
+                <span style={{ opacity: 0.75 }}>{t.name}</span>
+                <span style={{ margin: '0 2px', opacity: 0.5 }}>=</span>
+                <span>{t.value}</span>
+              </Tag>
+            ))}
+          </div>
+        )
+      },
+    },
   ]
   const columns = useResizableColumns(baseColumns)
 
@@ -220,8 +237,25 @@ export default function AgentsPage() {
                 <Descriptions.Item label="Instance ID">
                   <Text code copyable style={{ fontSize: 12 }}>{record.InstanceID}</Text>
                 </Descriptions.Item>
-                <Descriptions.Item label="Host ID">{(record as Agent & { Hostid?: string }).Hostid || '—'}</Descriptions.Item>
+                <Descriptions.Item label="Host ID">{record.Hostid || '—'}</Descriptions.Item>
                 <Descriptions.Item label="Agent Type">{record.AgentType}</Descriptions.Item>
+                {(() => {
+                  const tags = parseAgentTags(record)
+                  if (tags.length === 0) return null
+                  return (
+                    <Descriptions.Item label="Tags" span={3}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                        {tags.map(t => (
+                          <Tag key={t.name} style={{ margin: 0 }}>
+                            <span style={{ opacity: 0.75 }}>{t.name}</span>
+                            <span style={{ margin: '0 3px', opacity: 0.5 }}>=</span>
+                            <span>{t.value}</span>
+                          </Tag>
+                        ))}
+                      </div>
+                    </Descriptions.Item>
+                  )
+                })()}
               </Descriptions>
               <ConfigStatusTable instanceID={record.InstanceID} />
             </div>

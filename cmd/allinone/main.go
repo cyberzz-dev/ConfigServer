@@ -49,7 +49,7 @@ func main() {
 	}
 
 	// In All-in-One mode Redis is optional; nil means L1+DB only.
-	mgr := cache.New(st, nil /* no Redis */, cfg.L1MaxSizeMB, cfg.L1TTL, cfg.L2TTL)
+	mgr := cache.New(st, nil /* no Redis */, cfg.L1MaxSizeMB, cfg.L1TTL, cfg.L2TTL, false /* HFE irrelevant without Redis */)
 
 	// Metrics collector: always available for Prometheus scraping at /metrics.
 	// Push to a remote endpoint only when MetricsPushURL is configured.
@@ -61,7 +61,7 @@ func main() {
 	}
 
 	agentSrv := agentserver.NewAgentServer(cfg.AgentAddr(), mgr)
-	adminSrv := adminserver.NewAdminServer(cfg.AdminAddr(), mgr, webFS, mc.Handler())
+	adminSrv := adminserver.NewAdminServer(cfg.AdminAddr(), mgr, webFS, mc.Handler(), cfg.SMTP)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -1,11 +1,171 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LoongCollector ConfigServer Admin</title>
+    <style>
+      :root {
+        --lc-splash-bg:      #f2f3f3;
+        --lc-splash-text:    #262626;
+        --lc-splash-subtext: rgba(0,0,0,0.08);
+      }
+      :root.lc-dark {
+        --lc-splash-bg:      #0f1117;
+        --lc-splash-text:    #e0e6ef;
+        --lc-splash-subtext: rgba(255,255,255,0.08);
+      }
+
+      #app-loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: var(--lc-splash-bg);
+        z-index: 9999;
+        transition: opacity 0.4s ease, visibility 0.4s ease;
+      }
+      #app-loading.hidden {
+        opacity: 0;
+        visibility: hidden;
+      }
+
+      .lc-orbit {
+        position: relative;
+        width: 72px;
+        height: 72px;
+      }
+      .lc-orbit::before,
+      .lc-orbit::after {
+        content: '';
+        position: absolute;
+        border-radius: 50%;
+        border: 2px solid transparent;
+      }
+      .lc-orbit::before {
+        inset: 0;
+        border-top-color: #1677ff;
+        border-right-color: #1677ff;
+        animation: lc-spin 1.1s linear infinite;
+      }
+      .lc-orbit::after {
+        inset: 14px;
+        border-bottom-color: #69b1ff;
+        border-left-color: #69b1ff;
+        animation: lc-spin 0.75s linear infinite reverse;
+      }
+
+      .lc-dot {
+        position: absolute;
+        top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        width: 10px; height: 10px;
+        border-radius: 50%;
+        background: #1677ff;
+        box-shadow: 0 0 10px 3px rgba(22,119,255,0.45);
+        animation: lc-pulse 1.1s ease-in-out infinite;
+      }
+
+      .lc-brand {
+        margin-top: 28px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        font-size: 18px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        color: var(--lc-splash-text);
+        opacity: 0;
+        animation: lc-fadein 0.6s ease 0.3s forwards;
+      }
+      .lc-brand span { color: #1677ff; }
+
+      .lc-bar-wrap {
+        margin-top: 20px;
+        width: 160px;
+        height: 3px;
+        border-radius: 3px;
+        background: var(--lc-splash-subtext);
+        overflow: hidden;
+        opacity: 0;
+        animation: lc-fadein 0.6s ease 0.5s forwards;
+      }
+      .lc-bar {
+        height: 100%;
+        border-radius: 3px;
+        background: linear-gradient(90deg, #1677ff, #69b1ff);
+        animation: lc-progress 1.8s ease-in-out infinite;
+        transform-origin: left;
+      }
+
+      @keyframes lc-spin  { to { transform: rotate(360deg); } }
+      @keyframes lc-pulse {
+        0%, 100% { transform: translate(-50%,-50%) scale(1);   opacity: 1; }
+        50%       { transform: translate(-50%,-50%) scale(1.4); opacity: 0.6; }
+      }
+      @keyframes lc-fadein  { to { opacity: 1; } }
+      @keyframes lc-progress {
+        0%   { transform: scaleX(0);   margin-left: 0; }
+        50%  { transform: scaleX(0.6); margin-left: 0; }
+        100% { transform: scaleX(0);   margin-left: 100%; }
+      }
+    </style>
+    <script>
+      (function () {
+        try {
+          var s = localStorage.getItem('cs-theme');
+          if (s === 'dark' || (s !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches))
+            document.documentElement.classList.add('lc-dark');
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
+    <div id="app-loading">
+      <div class="lc-orbit"><div class="lc-dot"></div></div>
+      <div class="lc-brand"><span style="color:#1677ff">Loong</span><span style="color:#69b1ff">Collector</span> <span style="color:#36cfc9">Config</span> <span style="color:#95de64">Server</span></div>
+      <div class="lc-bar-wrap"><div class="lc-bar"></div></div>
+    </div>
+    <script>
+      (function () {
+        var MIN_MS = 800;
+        var startTime = Date.now();
+        var appReady = false;
+        var timerDone = false;
+
+        function removeSplash() {
+          var el = document.getElementById('app-loading');
+          if (!el) return;
+          el.classList.add('hidden');
+          var t = setTimeout(function () { el.remove(); }, 600);
+          el.addEventListener('transitionend', function () { clearTimeout(t); el.remove(); }, { once: true });
+        }
+
+        function tryRemove() {
+          if (appReady && timerDone) removeSplash();
+        }
+
+        // Minimum display time
+        setTimeout(function () { timerDone = true; tryRemove(); }, MIN_MS);
+
+        // App signals it's ready
+        window.addEventListener('app:ready', function () {
+          appReady = true;
+          var elapsed = Date.now() - startTime;
+          var remaining = MIN_MS - elapsed;
+          if (remaining > 0) {
+            setTimeout(tryRemove, remaining);
+          } else {
+            tryRemove();
+          }
+        }, { once: true });
+
+        // Hard fallback
+        setTimeout(removeSplash, 8000);
+      })();
+    </script>
+
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
