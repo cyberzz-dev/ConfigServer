@@ -20,7 +20,7 @@ const TYPE_COLORS: Record<string, string> = {
 
 export default function AuditPage() {
   const [logs, setLogs] = useState<AuditLog[]>([])
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(50)

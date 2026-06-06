@@ -1,24 +1,56 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
+import yaml from 'js-yaml'
 import {
-  Table, Button, Modal, Form, Input, InputNumber, Slider, Space, message,
+  Table, Button, Modal, Form, Input, InputNumber, Slider, Space, message, notification,
   Tag, Drawer, Descriptions, Statistic, Row, Col, Tooltip, Select, Progress,
-  Popconfirm, Tabs, Spin, AutoComplete, Card, Alert,
+  Tabs, Spin, AutoComplete, Card, Alert, Typography,
 } from 'antd'
+const { Text } = Typography
 import {
   PlusOutlined, PauseCircleOutlined, PlayCircleOutlined,
   CheckCircleOutlined, StopOutlined, BarChartOutlined, ReloadOutlined,
-  MinusCircleOutlined, EyeOutlined, EditOutlined,
+  MinusCircleOutlined, EyeOutlined, EditOutlined, SearchOutlined,
 } from '@ant-design/icons'
 import LineNumberedEditor from '../components/LineNumberedEditor'
 import DiffViewer from '../components/DiffViewer'
-import type { CanaryRelease, CanaryStats, AgentGroup } from '../api'
+import type { CanaryRelease, CanaryStats, CanaryAgent, AgentTag, AgentGroup } from '../api'
 import {
   listCanaries, createCanary, updateCanary, setCanaryPercent,
-  pauseCanary, resumeCanary, promoteCanary, abortCanary, getCanaryStats,
+  pauseCanary, resumeCanary, promoteCanary, abortCanary, getCanaryStats, getCanaryAgents,
   listPipelineConfigs, listInstanceConfigs,
   listGroups, createPipelineConfig, createInstanceConfig, addGroupConfig,
 } from '../api'
 import type { Config } from '../api'
+
+// ── YAML ↔ JSON helpers ───────────────────────────────────────────────────────
+// Convert JSON string to YAML for human-friendly display/editing.
+// If the string is not valid JSON (already YAML or empty), return as-is.
+function jsonToYaml(s: string): string {
+  if (!s || !s.trim()) return s
+  try {
+    const parsed = JSON.parse(s)
+    return yaml.dump(parsed, { indent: 2, lineWidth: -1 }).trimEnd()
+  } catch {
+    return s
+  }
+}
+
+// Convert a YAML or JSON string to JSON for storage.
+// If already valid JSON, returns as-is. Otherwise parses as YAML and serialises.
+function yamlToJson(s: string): string {
+  if (!s || !s.trim()) return s
+  try {
+    JSON.parse(s)
+    return s // already valid JSON
+  } catch {
+    try {
+      const parsed = yaml.load(s)
+      return JSON.stringify(parsed)
+    } catch {
+      return s // unparseable — pass through and let server validate
+    }
+  }
+}
 
 // ── Per-entry form item for batch canary creation ─────────────────────────────
 interface CanaryFormItemProps {
@@ -168,6 +200,21 @@ const STATUS_COLOR: Record<string, string> = {
   aborted:  'default',
 }
 
+const TYPE_COLORS: Record<string, string> = {
+  pipeline: 'geekblue',
+  instance: 'cyan',
+  onetime:  'orange',
+  group:    'gold',
+}
+
+// Text colors matching the Tag preset colors above
+const TYPE_TEXT_COLORS: Record<string, string> = {
+  geekblue: '#2f54eb',
+  cyan:     '#08979c',
+  orange:   '#d46b08',
+  gold:     '#d48806',
+}
+
 const STATUS_LABEL: Record<string, string> = {
   rolling:  'Rolling',
   paused:   'Paused',
@@ -181,7 +228,7 @@ function StatusTag({ status }: { status: string }) {
 
 export default function CanaryPage() {
   const [canaries, setCanaries] = useState<CanaryRelease[]>([])
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
 
   // Create drawer
   const [createOpen, setCreateOpen] = useState(false)
@@ -196,6 +243,30 @@ export default function CanaryPage() {
   const [statsLoading, setStatsLoading] = useState(false)
   const [stats, setStats] = useState<CanaryStats | null>(null)
   const [statsTarget, setStatsTarget] = useState<CanaryRelease | null>(null)
+  const [statsTab, setStatsTab] = useState<'summary' | 'agents'>('summary')
+  const [agentsData, setAgentsData] = useState<CanaryAgent[]>([])
+  const [agentsLoading, setAgentsLoading] = useState(false)
+  const [agentsSearch, setAgentsSearch] = useState('')
+  const [agentsBucketFilter, setAgentsBucketFilter] = useState<'all' | 'canary' | 'stable' | 'unknown'>('all')
+  const [agentsPage, setAgentsPage] = useState(1)
+  const [agentsPageSize, setAgentsPageSize] = useState(50)
+
+  const filteredAgents = useMemo(() => {
+    let data = agentsData
+    if (agentsBucketFilter !== 'all') {
+      data = data.filter(a => a.bucket === agentsBucketFilter)
+    }
+    const q = agentsSearch.trim().toLowerCase()
+    if (q) {
+      data = data.filter(a =>
+        a.instance_id.toLowerCase().includes(q) ||
+        a.ip.toLowerCase().includes(q) ||
+        a.hostname.toLowerCase().includes(q) ||
+        a.agent_type.toLowerCase().includes(q)
+      )
+    }
+    return data
+  }, [agentsData, agentsSearch, agentsBucketFilter])
 
   // Detail drawer
   const [detailTarget, setDetailTarget] = useState<CanaryRelease | null>(null)
@@ -207,6 +278,11 @@ export default function CanaryPage() {
   const [percentTarget, setPercentTarget] = useState<CanaryRelease | null>(null)
   const [percentValue, setPercentValue] = useState(0)
   const [percentLoading, setPercentLoading] = useState(false)
+
+  // Promote / Abort confirm modal
+  const [confirmAction, setConfirmAction] = useState<{ action: 'promote' | 'abort'; cr: CanaryRelease } | null>(null)
+  const [confirmInput, setConfirmInput] = useState('')
+  const [confirmLoading, setConfirmLoading] = useState(false)
 
   // Edit drawer
   const [editOpen, setEditOpen] = useState(false)
@@ -253,7 +329,7 @@ export default function CanaryPage() {
     const existingPipeline = new Set(pipelineConfigs.map(c => c.name))
     const existingInstance = new Set(instanceConfigs.map(c => c.name))
     let successCount = 0
-    const errors: string[] = []
+    const errors: { name: string; msg: string; isConflict: boolean }[] = []
     for (const entry of values.canaries) {
       try {
         const isNew = entry.config_type === 'pipeline'
@@ -277,7 +353,7 @@ export default function CanaryPage() {
           .filter(t => t && t.name)
           .map(t => ({ name: t.name.trim(), value: (t.value ?? '').trim() }))
         await createCanary(entry.config_type, entry.config_name, {
-          canary_detail: entry.canary_detail,
+          canary_detail: yamlToJson(entry.canary_detail),
           rollout_percent: entry.rollout_percent ?? 0,
           version_constraint: entry.version_constraint ?? '',
           ip_selector: ipList.length ? ipList : undefined,
@@ -285,7 +361,10 @@ export default function CanaryPage() {
         })
         successCount++
       } catch (e: any) {
-        errors.push(`${entry.config_name}: ${e?.response?.data?.message ?? 'failed'}`)
+        const status: number | undefined = e?.response?.status
+        const msg: string = e?.response?.data?.message ?? e?.message ?? 'failed'
+        // 409 Conflict = canary already exists; surface this specially
+        errors.push({ name: entry.config_name, msg, isConflict: status === 409 })
       }
     }
     setCreateLoading(false)
@@ -295,10 +374,35 @@ export default function CanaryPage() {
       form.resetFields()
       fetchCanaries()
     } else if (successCount > 0) {
-      message.warning(`${successCount} created, ${errors.length} failed: ${errors.join('; ')}`)
+      notification.warning({
+        message: `${successCount} created, ${errors.length} failed`,
+        description: (
+          <ul style={{ margin: 0, paddingLeft: 16 }}>
+            {errors.map((e, i) => (
+              <li key={i}><Text code>{e.name}</Text> — {e.msg}</li>
+            ))}
+          </ul>
+        ),
+        duration: 0,
+      })
       fetchCanaries()
     } else {
-      message.error(`Failed: ${errors.join('; ')}`)
+      notification.error({
+        message: errors.length === 1 && errors[0].isConflict
+          ? 'Canary release already exists'
+          : 'Failed to create canary release',
+        description: (
+          <ul style={{ margin: 0, paddingLeft: 16 }}>
+            {errors.map((e, i) => (
+              <li key={i}>
+                {errors.length > 1 && <><Text code>{e.name}</Text> — </>}
+                {e.msg}
+              </li>
+            ))}
+          </ul>
+        ),
+        duration: 0,
+      })
     }
   }
 
@@ -335,7 +439,7 @@ export default function CanaryPage() {
   const openEdit = (cr: CanaryRelease) => {
     setEditTarget(cr)
     editForm.setFieldsValue({
-      canary_detail: cr.canary_detail ?? '',
+      canary_detail: jsonToYaml(cr.canary_detail ?? ''),
       rollout_percent: cr.rollout_percent,
       version_constraint: cr.version_constraint ?? '',
       ip_selector: (cr.ip_selector ?? []).join('\n'),
@@ -362,7 +466,7 @@ export default function CanaryPage() {
         .filter(t => t && t.name)
         .map(t => ({ name: t.name.trim(), value: (t.value ?? '').trim() }))
       await updateCanary(editTarget.config_type, editTarget.config_name, {
-        canary_detail: values.canary_detail,
+        canary_detail: yamlToJson(values.canary_detail),
         rollout_percent: values.rollout_percent ?? 0,
         version_constraint: values.version_constraint ?? '',
         ip_selector: ipList.length ? ipList : undefined,
@@ -399,6 +503,11 @@ export default function CanaryPage() {
   const openStats = async (cr: CanaryRelease) => {
     setStatsTarget(cr)
     setStats(null)
+    setAgentsData([])
+    setAgentsSearch('')
+    setAgentsBucketFilter('all')
+    setAgentsPage(1)
+    setStatsTab('summary')
     setStatsOpen(true)
     setStatsLoading(true)
     try {
@@ -410,19 +519,43 @@ export default function CanaryPage() {
     }
   }
 
+  const loadCanaryAgents = async (cr: CanaryRelease) => {
+    setAgentsLoading(true)
+    try {
+      setAgentsData(await getCanaryAgents(cr.config_type, cr.config_name))
+    } catch {
+      message.error('Failed to load canary agents')
+    } finally {
+      setAgentsLoading(false)
+    }
+  }
+
+  const handleStatsTabChange = (key: string) => {
+    setStatsTab(key as 'summary' | 'agents')
+    setAgentsPage(1)
+    if (key === 'agents' && statsTarget && agentsData.length === 0 && !agentsLoading) {
+      loadCanaryAgents(statsTarget)
+    }
+  }
+
   const columns = [
     {
       title: 'Config Name',
       dataIndex: 'config_name',
       key: 'config_name',
       ellipsis: true,
+      render: (name: string, record: { config_type: string }) => (
+        <Text style={{ color: TYPE_TEXT_COLORS[TYPE_COLORS[record.config_type] ?? ''] ?? 'inherit', fontWeight: 500 }}>
+          {name}
+        </Text>
+      ),
     },
     {
       title: 'Type',
       dataIndex: 'config_type',
       key: 'config_type',
       width: 100,
-      render: (v: string) => <Tag>{v}</Tag>,
+      render: (v: string) => <Tag color={TYPE_COLORS[v] ?? 'default'}>{v}</Tag>,
     },
     {
       title: 'Status',
@@ -436,16 +569,18 @@ export default function CanaryPage() {
       dataIndex: 'rollout_percent',
       key: 'rollout_percent',
       width: 150,
+      align: 'left' as const,
       render: (v: number, cr: CanaryRelease) => (
-        <Space>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'flex-start' }}>
           <Progress
             percent={v}
             size="small"
+            showInfo={false}
             style={{ width: 80, marginBottom: 0 }}
             status={cr.status === 'paused' ? 'exception' : cr.status === 'promoted' ? 'success' : 'active'}
           />
-          <span style={{ fontSize: 12, color: '#8c8c8c' }}>{v}%</span>
-        </Space>
+          <span style={{ fontSize: 12, color: '#8c8c8c', minWidth: 32 }}>{v}%</span>
+        </div>
       ),
     },
     {
@@ -491,87 +626,142 @@ export default function CanaryPage() {
       dataIndex: 'updated_at',
       key: 'updated_at',
       width: 170,
-      render: (v: string) => new Date(v).toLocaleString(),
+      render: (v: string) => {
+        const d = new Date(v)
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`
+      },
     },
     {
       title: 'Actions',
       key: 'actions',
-      width: 260,
+      width: 290,
       render: (_: unknown, cr: CanaryRelease) => {
         const isActive = cr.status === 'rolling' || cr.status === 'paused'
         return (
-          <Space size={4}>
-            {/* Adjust percent — only when rolling or paused */}
-            {isActive && (
-              <Tooltip title="Adjust rollout %">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            {/* ── Operational area (fixed width) ─────────────────── */}
+            <div style={{ width: 124, display: 'flex', alignItems: 'center', gap: 2 }}>
+              {/* Rollout percent badge */}
+              {isActive ? (
+                <Tooltip title="Adjust rollout %">
+                  <Tag
+                    color="blue"
+                    style={{
+                      cursor: 'pointer',
+                      fontWeight: 600,
+                      fontSize: 12,
+                      padding: '0 4px',
+                      borderRadius: 10,
+                      userSelect: 'none',
+                      width: 46,
+                      textAlign: 'left',
+                      marginInlineEnd: 0,
+                      display: 'inline-block',
+                    }}
+                    onClick={() => { setPercentValue(cr.rollout_percent); setPercentTarget(cr) }}
+                  >
+                    {cr.rollout_percent}%
+                  </Tag>
+                </Tooltip>
+              ) : (
+                <span style={{ display: 'inline-block', width: 46 }} />
+              )}
+
+              {/* Pause / Resume */}
+              {cr.status === 'rolling' ? (
+                <Tooltip title="Pause rollout">
+                  <Button
+                    size="small"
+                    icon={<PauseCircleOutlined />}
+                    style={{ color: '#fa8c16', borderColor: '#fa8c16' }}
+                    onClick={() => handleAction('pause', cr)}
+                  />
+                </Tooltip>
+              ) : cr.status === 'paused' ? (
+                <Tooltip title="Resume rollout">
+                  <Button
+                    size="small"
+                    type="primary"
+                    icon={<PlayCircleOutlined />}
+                    style={{ backgroundColor: '#13c2c2', borderColor: '#13c2c2' }}
+                    onClick={() => handleAction('resume', cr)}
+                  />
+                </Tooltip>
+              ) : (
+                <span style={{ display: 'inline-block', width: 24 }} />
+              )}
+
+              {/* Promote */}
+              {isActive ? (
+                <Tooltip title="Promote to stable">
+                  <Button
+                    size="small"
+                    type="primary"
+                    icon={<CheckCircleOutlined />}
+                    style={{ backgroundColor: '#52c41a', borderColor: '#52c41a' }}
+                    onClick={() => { setConfirmInput(''); setConfirmAction({ action: 'promote', cr }) }}
+                  />
+                </Tooltip>
+              ) : (
+                <span style={{ display: 'inline-block', width: 24 }} />
+              )}
+
+              {/* Abort */}
+              {isActive ? (
+                <Tooltip title="Abort">
+                  <Button
+                    size="small"
+                    type="primary"
+                    danger
+                    icon={<StopOutlined />}
+                    onClick={() => { setConfirmInput(''); setConfirmAction({ action: 'abort', cr }) }}
+                  />
+                </Tooltip>
+              ) : (
+                <span style={{ display: 'inline-block', width: 24 }} />
+              )}
+            </div>
+
+            {/* ── Divider ────────────────────────────────────────── */}
+            <span style={{ borderLeft: '1px solid #d9d9d9', height: 16, margin: '0 1px', flexShrink: 0 }} />
+
+            {/* ── Utility area (always visible, always aligned) ──── */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+              {/* Edit — only for active canaries */}
+              {isActive ? (
+                <Tooltip title="Edit canary">
+                  <Button
+                    size="small"
+                    type="text"
+                    icon={<EditOutlined style={{ color: '#1677ff' }} />}
+                    onClick={() => openEdit(cr)}
+                  />
+                </Tooltip>
+              ) : (
+                <span style={{ display: 'inline-block', width: 24 }} />
+              )}
+
+              {/* Detail */}
+              <Tooltip title="View config detail">
                 <Button
                   size="small"
-                  onClick={() => { setPercentValue(cr.rollout_percent); setPercentTarget(cr) }}
-                >
-                  {cr.rollout_percent}%
-                </Button>
+                  type="text"
+                  icon={<EyeOutlined style={{ color: '#595959' }} />}
+                  onClick={() => openDetail(cr)}
+                />
               </Tooltip>
-            )}
 
-            {/* Pause / Resume */}
-            {cr.status === 'rolling' && (
-              <Tooltip title="Pause rollout">
-                <Button size="small" icon={<PauseCircleOutlined />} onClick={() => handleAction('pause', cr)} />
+              {/* Stats */}
+              <Tooltip title="View stats">
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<BarChartOutlined style={{ color: '#722ed1' }} />}
+                  onClick={() => openStats(cr)}
+                />
               </Tooltip>
-            )}
-            {cr.status === 'paused' && (
-              <Tooltip title="Resume rollout">
-                <Button size="small" icon={<PlayCircleOutlined />} onClick={() => handleAction('resume', cr)} />
-              </Tooltip>
-            )}
-
-            {/* Promote */}
-            {isActive && (
-              <Popconfirm
-                title="Promote canary to stable?"
-                description="The canary config will replace the stable version for all agents."
-                onConfirm={() => handleAction('promote', cr)}
-                okText="Promote"
-                okButtonProps={{ danger: false }}
-              >
-                <Tooltip title="Promote to stable">
-                  <Button size="small" icon={<CheckCircleOutlined />} />
-                </Tooltip>
-              </Popconfirm>
-            )}
-
-            {/* Abort */}
-            {isActive && (
-              <Popconfirm
-                title="Abort canary release?"
-                description="Agents will fall back to the stable config version."
-                onConfirm={() => handleAction('abort', cr)}
-                okText="Abort"
-                okButtonProps={{ danger: true }}
-              >
-                <Tooltip title="Abort">
-                  <Button size="small" icon={<StopOutlined />} danger />
-                </Tooltip>
-              </Popconfirm>
-            )}
-
-            {/* Detail */}
-            <Tooltip title="View config detail">
-              <Button size="small" icon={<EyeOutlined />} onClick={() => openDetail(cr)} />
-            </Tooltip>
-
-            {/* Edit — only for active canaries */}
-            {isActive && (
-              <Tooltip title="Edit canary">
-                <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(cr)} />
-              </Tooltip>
-            )}
-
-            {/* Stats */}
-            <Tooltip title="View stats">
-              <Button size="small" icon={<BarChartOutlined />} onClick={() => openStats(cr)} />
-            </Tooltip>
-          </Space>
+            </div>
+          </div>
         )
       },
     },
@@ -658,6 +848,68 @@ export default function CanaryPage() {
         </Form>
       </Drawer>
 
+      {/* ── Promote / Abort confirm modal ── */}
+      {(() => {
+        if (!confirmAction) return null
+        const isAbort = confirmAction.action === 'abort'
+        const configName = confirmAction.cr.config_name
+        const matched = confirmInput === configName
+        const handleOk = async () => {
+          if (!matched) return
+          setConfirmLoading(true)
+          try {
+            await handleAction(confirmAction.action, confirmAction.cr)
+            setConfirmAction(null)
+          } finally {
+            setConfirmLoading(false)
+          }
+        }
+        return (
+          <Modal
+            title={
+              <span style={{ color: isAbort ? '#ff4d4f' : '#52c41a' }}>
+                {isAbort ? '⚠ Confirm Abort' : '✔ Confirm Promote'}
+              </span>
+            }
+            open
+            onOk={handleOk}
+            onCancel={() => setConfirmAction(null)}
+            okText={isAbort ? 'Abort' : 'Promote'}
+            cancelText="Cancel"
+            okButtonProps={{ danger: isAbort, disabled: !matched, loading: confirmLoading, ...(isAbort ? {} : { style: { backgroundColor: '#52c41a', borderColor: '#52c41a' } }) }}
+            closable={!confirmLoading}
+            maskClosable={false}
+            destroyOnClose
+          >
+            <Alert
+              type={isAbort ? 'error' : 'warning'}
+              showIcon
+              message={isAbort
+                ? <>Agents will <strong>fall back</strong> to the stable config. This cannot be undone.</>
+                : <>The canary config will <strong>replace the stable version</strong> for all agents. This cannot be undone.</>
+              }
+              style={{ marginBottom: 16 }}
+            />
+            <p style={{ marginBottom: 8 }}>
+              Type <Text code>{configName}</Text> to confirm:
+            </p>
+            <Input
+              value={confirmInput}
+              onChange={e => setConfirmInput(e.target.value)}
+              placeholder={configName}
+              onPressEnter={handleOk}
+              autoFocus
+              status={confirmInput && !matched ? 'error' : undefined}
+            />
+            {confirmInput && !matched && (
+              <div style={{ color: '#ff4d4f', fontSize: 12, marginTop: 4 }}>
+                Input does not match the config name
+              </div>
+            )}
+          </Modal>
+        )
+      })()}
+
       {/* ── Percent edit modal ── */}
       <Modal
         title={`Adjust Rollout — ${percentTarget?.config_name}`}
@@ -668,7 +920,23 @@ export default function CanaryPage() {
         confirmLoading={percentLoading}
         destroyOnClose
       >
-        <div style={{ padding: '24px 0' }}>
+        <div style={{ padding: '24px 0 8px' }}>
+          {/* Current value display */}
+          <div style={{ textAlign: 'center', marginBottom: 20 }}>
+            <span style={{
+              fontSize: 48,
+              fontWeight: 700,
+              fontVariantNumeric: 'tabular-nums',
+              lineHeight: 1,
+              background: 'linear-gradient(135deg, #1677ff 0%, #69b1ff 100%)',
+              WebkitBackgroundClip: 'text',
+              WebkitTextFillColor: 'transparent',
+            }}>
+              {percentValue}
+            </span>
+            <span style={{ fontSize: 22, fontWeight: 600, color: '#1677ff', marginLeft: 2 }}>%</span>
+          </div>
+
           <Row align="middle" gutter={16}>
             <Col flex="auto">
               <Slider
@@ -676,6 +944,11 @@ export default function CanaryPage() {
                 value={percentValue}
                 onChange={setPercentValue}
                 marks={{ 0: '0%', 25: '25%', 50: '50%', 75: '75%', 100: '100%' }}
+                tooltip={{ formatter: (v) => `${v}%` }}
+                styles={{
+                  track: { background: 'linear-gradient(90deg, #1677ff, #69b1ff)' },
+                  handle: { borderColor: '#1677ff', width: 18, height: 18, marginTop: -7 },
+                }}
               />
             </Col>
             <Col>
@@ -685,6 +958,7 @@ export default function CanaryPage() {
                 onChange={v => setPercentValue(v ?? 0)}
                 addonAfter="%"
                 style={{ width: 90 }}
+                size="large"
               />
             </Col>
           </Row>
@@ -700,7 +974,7 @@ export default function CanaryPage() {
         extra={
           detailTarget && (
             <Space>
-              <Tag>{detailTarget.config_type}</Tag>
+              <Tag color={TYPE_COLORS[detailTarget.config_type] ?? 'default'}>{detailTarget.config_type}</Tag>
               <StatusTag status={detailTarget.status} />
             </Space>
           )
@@ -740,7 +1014,7 @@ export default function CanaryPage() {
                 </Descriptions.Item>
               )}
               <Descriptions.Item label="Created By">{detailTarget.created_by || <span style={{ color: '#bfbfbf' }}>—</span>}</Descriptions.Item>
-              <Descriptions.Item label="Updated">{new Date(detailTarget.updated_at).toLocaleString()}</Descriptions.Item>
+              <Descriptions.Item label="Updated">{(() => { const d = new Date(detailTarget.updated_at); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}` })()}</Descriptions.Item>
             </Descriptions>
             <Tabs
               activeKey={detailTab}
@@ -753,7 +1027,7 @@ export default function CanaryPage() {
                   label: 'Canary Content',
                   children: (
                     <LineNumberedEditor
-                      value={detailTarget.canary_detail ?? ''}
+                      value={jsonToYaml(detailTarget.canary_detail ?? '')}
                       onChange={() => {}}
                       style={{ height: 560 }}
                       readOnly
@@ -772,8 +1046,8 @@ export default function CanaryPage() {
                     <div style={{ textAlign: 'center', padding: 40 }}><Spin /></div>
                   ) : (
                     <DiffViewer
-                      oldText={stableDetail}
-                      newText={detailTarget.canary_detail ?? ''}
+                      oldText={jsonToYaml(stableDetail)}
+                      newText={jsonToYaml(detailTarget.canary_detail ?? '')}
                       oldLabel={`Stable (${detailTarget.config_name})`}
                       newLabel={`Canary v${detailTarget.canary_version}`}
                       style={{ height: 560 }}
@@ -791,73 +1065,236 @@ export default function CanaryPage() {
         title={`Canary Stats — ${statsTarget?.config_name}`}
         open={statsOpen}
         onClose={() => setStatsOpen(false)}
-        width={480}
+        width={1100}
         extra={
           <Button
             icon={<ReloadOutlined />}
             size="small"
-            onClick={() => statsTarget && openStats(statsTarget)}
-            loading={statsLoading}
+            onClick={() => {
+              if (!statsTarget) return
+              if (statsTab === 'summary') openStats(statsTarget)
+              else loadCanaryAgents(statsTarget)
+            }}
+            loading={statsTab === 'summary' ? statsLoading : agentsLoading}
           >
             Refresh
           </Button>
         }
       >
-        {stats ? (
-          <>
-            <Descriptions bordered size="small" column={1} style={{ marginBottom: 24 }}>
-              <Descriptions.Item label="Config">{stats.config_name}</Descriptions.Item>
-              <Descriptions.Item label="Type"><Tag>{stats.config_type}</Tag></Descriptions.Item>
-              <Descriptions.Item label="Status"><StatusTag status={stats.status} /></Descriptions.Item>
-              <Descriptions.Item label="Rollout Target">
-                <Progress percent={stats.rollout_percent} size="small" style={{ width: 160, marginBottom: 0 }} />
-              </Descriptions.Item>
-            </Descriptions>
+        <Tabs
+          activeKey={statsTab}
+          onChange={handleStatsTabChange}
+          items={[
+            {
+              key: 'summary',
+              label: 'Summary',
+              children: stats ? (
+                <>
+                  <Descriptions bordered size="small" column={1} style={{ marginBottom: 24 }}>
+                    <Descriptions.Item label="Config">{stats.config_name}</Descriptions.Item>
+                    <Descriptions.Item label="Type"><Tag color={TYPE_COLORS[stats.config_type] ?? 'default'}>{stats.config_type}</Tag></Descriptions.Item>
+                    <Descriptions.Item label="Status"><StatusTag status={stats.status} /></Descriptions.Item>
+                    <Descriptions.Item label="Rollout Target">
+                      <Progress percent={stats.rollout_percent} size="small" style={{ width: 160, marginBottom: 0 }} />
+                    </Descriptions.Item>
+                  </Descriptions>
 
-            <Row gutter={16}>
-              <Col span={8}>
-                <Statistic
-                  title="Canary Hosts"
-                  value={stats.canary_hosts}
-                  valueStyle={{ color: '#1677ff' }}
-                />
-              </Col>
-              <Col span={8}>
-                <Statistic
-                  title="Stable Hosts"
-                  value={stats.stable_hosts}
-                  valueStyle={{ color: '#52c41a' }}
-                />
-              </Col>
-              <Col span={8}>
-                <Statistic
-                  title="Unknown"
-                  value={stats.unknown_hosts}
-                  valueStyle={{ color: '#8c8c8c' }}
-                  suffix={<Tooltip title="Hosts without a stable identifier (Hostid/Hostname) — cannot be bucketed"><span style={{ fontSize: 12 }}>ℹ</span></Tooltip>}
-                />
-              </Col>
-            </Row>
+                  <Row gutter={16}>
+                    <Col span={6}>
+                      <Statistic
+                        title="Canary Agents"
+                        value={stats.canary_agents}
+                        valueStyle={{ color: '#1677ff' }}
+                      />
+                    </Col>
+                    <Col span={6}>
+                      <Statistic
+                        title="Stable Agents"
+                        value={stats.stable_agents}
+                        valueStyle={{ color: '#52c41a' }}
+                      />
+                    </Col>
+                    <Col span={6}>
+                      <Statistic
+                        title="Not Targeted"
+                        value={stats.not_targeted}
+                        valueStyle={{ color: '#fa8c16' }}
+                        suffix={<Tooltip title="Agents outside the canary's IP / tag / version scope — they always receive the stable config regardless of rollout %"><span style={{ fontSize: 12 }}>ℹ</span></Tooltip>}
+                      />
+                    </Col>
+                    <Col span={6}>
+                      <Statistic
+                        title="Unknown"
+                        value={stats.unknown_agents}
+                        valueStyle={{ color: '#8c8c8c' }}
+                        suffix={<Tooltip title="Agents without a stable identifier (InstanceID/Hostid/Hostname) — cannot be bucketed"><span style={{ fontSize: 12 }}>ℹ</span></Tooltip>}
+                      />
+                    </Col>
+                  </Row>
 
-            <div style={{ marginTop: 24 }}>
-              <Progress
-                percent={stats.total_hosts > 0
-                  ? Math.round((stats.canary_hosts / stats.total_hosts) * 100)
-                  : 0}
-                success={{ percent: stats.total_hosts > 0 ? Math.round((stats.canary_hosts / stats.total_hosts) * 100) : 0 }}
-                format={() => `${stats.canary_hosts} / ${stats.total_hosts} hosts`}
-                strokeColor="#1677ff"
-              />
-              <div style={{ marginTop: 8, fontSize: 12, color: '#8c8c8c' }}>
-                Actual canary distribution based on Hostid bucketing
-              </div>
-            </div>
-          </>
-        ) : (
-          <div style={{ textAlign: 'center', padding: 40, color: '#8c8c8c' }}>
-            {statsLoading ? 'Loading…' : 'No data'}
-          </div>
-        )}
+                  <div style={{ marginTop: 24 }}>
+                    {/* Progress is over targeted agents (canary + stable) to reflect the meaningful population */}
+                    {(() => {
+                      const targeted = stats.canary_agents + stats.stable_agents
+                      const pct = targeted > 0 ? Math.round((stats.canary_agents / targeted) * 100) : 0
+                      return (
+                        <>
+                          <Progress
+                            percent={pct}
+                            format={() => `${stats.canary_agents} / ${targeted} targeted agents`}
+                            strokeColor="#1677ff"
+                          />
+                          <div style={{ marginTop: 8, fontSize: 12, color: '#8c8c8c' }}>
+                            Canary distribution among targeted agents (InstanceID bucketing).
+                            {stats.not_targeted > 0 && (
+                              <span style={{ color: '#fa8c16' }}> {stats.not_targeted} agent{stats.not_targeted !== 1 ? 's' : ''} outside IP/tag/version scope.</span>
+                            )}
+                          </div>
+                        </>
+                      )
+                    })()}
+                  </div>
+                </>
+              ) : (
+                <div style={{ textAlign: 'center', padding: 40, color: '#8c8c8c' }}>
+                  {statsLoading ? <Spin /> : 'No data'}
+                </div>
+              ),
+            },
+            {
+              key: 'agents',
+              label: 'Agents',
+              children: (
+                <>
+                  {/* Toolbar */}
+                  <Space style={{ marginBottom: 10, display: 'flex', flexWrap: 'wrap' }}>
+                    <Input
+                      prefix={<SearchOutlined style={{ color: '#bfbfbf' }} />}
+                      placeholder="Search Instance ID / IP / Hostname / Type…"
+                      value={agentsSearch}
+                      onChange={e => { setAgentsSearch(e.target.value); setAgentsPage(1) }}
+                      allowClear
+                      style={{ width: 380 }}
+                    />
+                    <Select
+                      value={agentsBucketFilter}
+                      onChange={v => { setAgentsBucketFilter(v); setAgentsPage(1) }}
+                      style={{ width: 160 }}
+                      options={[
+                        { label: 'All Buckets', value: 'all' },
+                        { label: 'Canary', value: 'canary' },
+                        { label: 'Stable', value: 'stable' },
+                        { label: 'Not Targeted', value: 'not_targeted' },
+                        { label: 'Unknown', value: 'unknown' },
+                      ]}
+                    />
+                    <span style={{ fontSize: 12, color: '#8c8c8c' }}>
+                      {filteredAgents.length !== agentsData.length
+                        ? `${filteredAgents.length} / ${agentsData.length} agents`
+                        : `${agentsData.length} agents total`}
+                    </span>
+                  </Space>
+                  <Table<CanaryAgent>
+                    dataSource={filteredAgents}
+                    rowKey="instance_id"
+                    loading={agentsLoading}
+                    size="small"
+                    scroll={{ x: 1060 }}
+                    pagination={{
+                      current: agentsPage,
+                      pageSize: agentsPageSize,
+                      showSizeChanger: true,
+                      pageSizeOptions: ['20', '50', '100', '500'],
+                      showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
+                      onChange: (page, size) => { setAgentsPage(page); setAgentsPageSize(size) },
+                    }}
+                    columns={[
+                      {
+                        title: 'Instance ID',
+                        dataIndex: 'instance_id',
+                        key: 'instance_id',
+                        width: 280,
+                        ellipsis: true,
+                        render: (id: string) => <Text copyable code style={{ fontSize: 11 }}>{id}</Text>,
+                      },
+                      {
+                        title: 'Type',
+                        dataIndex: 'agent_type',
+                        key: 'agent_type',
+                        width: 110,
+                        ellipsis: true,
+                      },
+                      {
+                        title: 'IP',
+                        dataIndex: 'ip',
+                        key: 'ip',
+                        width: 140,
+                      },
+                      {
+                        title: 'Hostname',
+                        dataIndex: 'hostname',
+                        key: 'hostname',
+                        ellipsis: true,
+                        width: 200,
+                      },
+                      {
+                        title: 'Version',
+                        dataIndex: 'version',
+                        key: 'version',
+                        width: 100,
+                      },
+                      {
+                        title: 'Tags',
+                        key: 'tags',
+                        width: 220,
+                        render: (_: unknown, record: CanaryAgent) => {
+                          const tags: AgentTag[] = record.tags ?? []
+                          if (tags.length === 0) return <span style={{ color: '#bfbfbf', fontSize: 12 }}>—</span>
+                          return (
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2 }}>
+                              {tags.map((t, i) => (
+                                <Tag key={i} style={{ fontSize: 11, margin: 0 }}>{t.name} = {t.value}</Tag>
+                              ))}
+                            </div>
+                          )
+                        },
+                      },
+                      {
+                        title: 'Bucket',
+                        dataIndex: 'bucket',
+                        key: 'bucket',
+                        width: 90,
+                        fixed: 'right' as const,
+                        filters: [
+                          { text: 'Canary', value: 'canary' },
+                          { text: 'Stable', value: 'stable' },
+                          { text: 'Not Targeted', value: 'not_targeted' },
+                          { text: 'Unknown', value: 'unknown' },
+                        ],
+                        onFilter: (value, record) => record.bucket === value,
+                        render: (bucket: string) => {
+                          const colorMap: Record<string, string> = {
+                            canary: 'blue',
+                            stable: 'green',
+                            not_targeted: 'orange',
+                            unknown: 'default',
+                          }
+                          const labelMap: Record<string, string> = {
+                            canary: 'Canary',
+                            stable: 'Stable',
+                            not_targeted: 'Not Targeted',
+                            unknown: 'Unknown',
+                          }
+                          return <Tag color={colorMap[bucket] ?? 'default'}>{labelMap[bucket] ?? bucket}</Tag>
+                        },
+                      },
+                    ]}
+                  />
+                </>
+              ),
+            },
+          ]}
+        />
       </Drawer>
 
       {/* ── Edit drawer ── */}

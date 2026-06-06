@@ -10,7 +10,8 @@ export default defineConfig({
       output: {
         manualChunks: {
           'vendor-react': ['react', 'react-dom', 'react-router-dom'],
-          'vendor-antd':  ['antd', '@ant-design/icons'],
+          'vendor-antd':  ['antd'],
+          'vendor-icons': ['@ant-design/icons'],
           'vendor-utils': ['dayjs', 'axios', 'js-yaml'],
         },
       },

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -26,12 +27,14 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/alibaba/ilogtail/config_server/internal/cache"
+	"github.com/alibaba/ilogtail/config_server/internal/config"
 	"github.com/alibaba/ilogtail/config_server/internal/model"
 )
 
 // AdminHandler provides the REST API consumed by the admin WebUI and operators.
 type AdminHandler struct {
-	mgr *cache.Manager
+	mgr  *cache.Manager
+	smtp config.SMTPConfig
 }
 
 // groupSnapshot is stored as history Detail when a group is deleted,
@@ -45,8 +48,8 @@ type groupSnapshot struct {
 }
 
 // NewAdminHandler creates an AdminHandler backed by the given cache manager.
-func NewAdminHandler(mgr *cache.Manager) *AdminHandler {
-	return &AdminHandler{mgr: mgr}
+func NewAdminHandler(mgr *cache.Manager, smtp config.SMTPConfig) *AdminHandler {
+	return &AdminHandler{mgr: mgr, smtp: smtp}
 }
 
 // RegisterAdminRoutes wires all admin REST endpoints into mux.
@@ -100,12 +103,19 @@ func RegisterAdminRoutes(mux *http.ServeMux, h *AdminHandler) {
 	mux.HandleFunc("POST /api/v1/auth/init", h.AuthInit)
 	mux.HandleFunc("POST /api/v1/auth/login", h.AuthLogin)
 	mux.HandleFunc("POST /api/v1/auth/logout", h.AuthLogout)
+	mux.HandleFunc("POST /api/v1/auth/forgot-password", h.ForgotPassword)
+	mux.HandleFunc("POST /api/v1/auth/reset-password", h.ResetPassword)
+	mux.HandleFunc("POST /api/v1/auth/login/otp", h.OTPLoginStep)
 
 	// Auth (requires session — protected by requireAuth middleware)
 	mux.HandleFunc("POST /api/v1/auth/change-password", h.AuthChangePassword)
+	mux.HandleFunc("POST /api/v1/auth/otp/setup", h.OTPSetup)
+	mux.HandleFunc("POST /api/v1/auth/otp/enable", h.OTPEnable)
+	mux.HandleFunc("POST /api/v1/auth/otp/disable", h.OTPDisable)
 
 	// Current user info (any authenticated user)
 	mux.HandleFunc("GET /api/v1/me", h.GetMe)
+	mux.HandleFunc("PUT /api/v1/me/email", h.SetMyEmail)
 
 	// User management (admin only)
 	mux.Handle("GET /api/v1/users", requireAdmin(http.HandlerFunc(h.ListUsers)))
@@ -113,6 +123,7 @@ func RegisterAdminRoutes(mux *http.ServeMux, h *AdminHandler) {
 	mux.Handle("DELETE /api/v1/users/{username}", requireAdmin(http.HandlerFunc(h.DeleteUser)))
 	mux.Handle("PUT /api/v1/users/{username}/password", requireAdmin(http.HandlerFunc(h.ResetUserPassword)))
 	mux.Handle("PUT /api/v1/users/{username}/role", requireAdmin(http.HandlerFunc(h.AssignUserRole)))
+	mux.Handle("PUT /api/v1/users/{username}/email", requireAdmin(http.HandlerFunc(h.SetUserEmail)))
 
 	// Role management (admin only)
 	mux.Handle("GET /api/v1/roles", requireAdmin(http.HandlerFunc(h.ListRoles)))
@@ -140,6 +151,7 @@ func RegisterAdminRoutes(mux *http.ServeMux, h *AdminHandler) {
 	mux.HandleFunc("POST /api/v1/configs/{type}/{name}/canary/promote", h.PromoteCanary)
 	mux.HandleFunc("POST /api/v1/configs/{type}/{name}/canary/abort", h.AbortCanary)
 	mux.HandleFunc("GET /api/v1/configs/{type}/{name}/canary/stats", h.GetCanaryStats)
+	mux.HandleFunc("GET /api/v1/configs/{type}/{name}/canary/agents", h.GetCanaryAgents)
 }
 
 // ── JSON envelope ─────────────────────────────────────────────────────────────
@@ -1290,6 +1302,29 @@ func (h *AdminHandler) saveHistory(ctx context.Context, resourceType, resourceNa
 	}
 }
 
+// realClientIP extracts the best-effort client IP from an HTTP request.
+// It checks X-Forwarded-For (first non-empty element) and X-Real-IP before
+// falling back to r.RemoteAddr, stripping the port when present.
+func realClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// X-Forwarded-For may be "client, proxy1, proxy2"; use the first entry.
+		if idx := strings.IndexByte(xff, ','); idx != -1 {
+			xff = xff[:idx]
+		}
+		if ip := strings.TrimSpace(xff); ip != "" {
+			return ip
+		}
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		return xri
+	}
+	// Strip port from RemoteAddr (host:port or [::1]:port).
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 // logAudit records an audit log entry (best-effort).
 // detail is the operation-specific body/content to append after the request line.
 func (h *AdminHandler) logAudit(r *http.Request, statusCode int, action, resourceType, resourceName, detail string) {
@@ -1304,7 +1339,7 @@ func (h *AdminHandler) logAudit(r *http.Request, statusCode int, action, resourc
 		ResourceType: resourceType,
 		ResourceName: resourceName,
 		Detail:       fullDetail,
-		ClientIP:     r.RemoteAddr,
+		ClientIP:     realClientIP(r),
 		CreatedAt:    time.Now(),
 	}
 	if err := h.mgr.CreateAuditLog(r.Context(), entry); err != nil {
@@ -1838,6 +1873,18 @@ func (h *AdminHandler) CreateCanary(w http.ResponseWriter, r *http.Request) {
 		Status:            model.CanaryStatusRolling,
 		CreatedBy:         createdBy,
 	}
+
+	// Check whether a canary release already exists for this config.
+	if existing, err := h.mgr.GetCanary(r.Context(), name, cfgType); err != nil {
+		internalError(w, err)
+		return
+	} else if existing != nil {
+		writeJSON(w, http.StatusConflict, 1,
+			fmt.Sprintf("a canary release for '%s' already exists (status: %s); abort or promote it before creating a new one", name, existing.Status),
+			nil)
+		return
+	}
+
 	if err := h.mgr.CreateCanary(r.Context(), cr); err != nil {
 		internalError(w, err)
 		return
@@ -2185,14 +2232,15 @@ func (h *AdminHandler) GetCanaryStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Deduplicate by stable host identity so that a restarted agent isn't
-	// counted twice (InstanceID changes on restart, but Hostid does not).
-	type hostEntry struct {
-		hostKey string // Hostid or Hostname
-		bucket  int
-	}
-	seen := make(map[string]struct{}, len(agents))
-	var canaryCount, stableCount, unknownCount int
+	// Each InstanceID uniquely identifies a running agent process, so no
+	// deduplication is needed — two agents on the same host are counted separately.
+	//
+	// Categorisation:
+	//   canary      — passes all filters AND bucket < RolloutPercent
+	//   stable      — passes all filters AND bucket >= RolloutPercent (truly in the stable bucket)
+	//   not_targeted — fails IP / tag / version filter; outside this canary's scope
+	//   unknown     — no stable identity; cannot compute bucket
+	var canaryCount, stableCount, notTargetedCount, unknownCount int
 
 	for _, agent := range agents {
 		// Parse the agent's reported tags so IP/tag canary filters are honored.
@@ -2210,34 +2258,30 @@ func (h *AdminHandler) GetCanaryStats(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		match := model.AgentMatchContext{
-			IP:       agent.IP,
-			Hostid:   agent.Hostid,
-			Hostname: agent.Hostname,
-			Version:  agent.Version,
-			Tags:     tags,
+			InstanceID: agent.InstanceID,
+			IP:         agent.IP,
+			Hostid:     agent.Hostid,
+			Hostname:   agent.Hostname,
+			Version:    agent.Version,
+			Tags:       tags,
 		}
-		_, hasBucket := model.CanaryBucket(match, name)
+		bucket, hasBucket := model.CanaryBucket(match, name)
 		if !hasBucket {
 			unknownCount++
 			continue
 		}
 
-		// Deduplicate by stable host key.
-		key := agent.Hostid
-		if key == "" {
-			key = agent.Hostname
-		}
-		if _, dup := seen[key]; dup {
-			continue
-		}
-		seen[key] = struct{}{}
-
-		eligible, err := model.CanaryEligible(cr, match, name)
+		targeted, err := model.CanaryTargeted(cr, match)
 		if err != nil {
 			internalError(w, err)
 			return
 		}
-		if eligible {
+		if !targeted {
+			notTargetedCount++
+			continue
+		}
+
+		if bucket < cr.RolloutPercent {
 			canaryCount++
 		} else {
 			stableCount++
@@ -2249,9 +2293,112 @@ func (h *AdminHandler) GetCanaryStats(w http.ResponseWriter, r *http.Request) {
 		"config_type":     cfgType,
 		"rollout_percent": cr.RolloutPercent,
 		"status":          cr.Status,
-		"canary_hosts":    canaryCount,
-		"stable_hosts":    stableCount,
-		"unknown_hosts":   unknownCount, // no stable identity — cannot bucket
-		"total_hosts":     canaryCount + stableCount + unknownCount,
+		"canary_agents":   canaryCount,
+		"stable_agents":   stableCount,
+		"not_targeted":    notTargetedCount, // fail IP/tag/version filter — outside canary scope
+		"unknown_agents":  unknownCount,     // no stable identity — cannot bucket
+		"total_agents":    canaryCount + stableCount + notTargetedCount + unknownCount,
 	})
+}
+
+// canaryAgentResp is a single agent entry returned by GetCanaryAgents.
+type canaryAgentResp struct {
+	InstanceID string `json:"instance_id"`
+	AgentType  string `json:"agent_type"`
+	IP         string `json:"ip"`
+	Hostname   string `json:"hostname"`
+	Version    string `json:"version"`
+	Tags       []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	} `json:"tags"`
+	Bucket string `json:"bucket"` // "canary" | "stable" | "not_targeted" | "unknown"
+}
+
+// GetCanaryAgents lists every agent with its canary bucket assignment for a
+// specific canary config.
+//
+// GET /api/v1/configs/{type}/{name}/canary/agents
+func (h *AdminHandler) GetCanaryAgents(w http.ResponseWriter, r *http.Request) {
+	cfgType, ok2 := configTypeFromPath(r.PathValue("type"))
+	if !ok2 {
+		badRequest(w, "type must be 'pipeline' or 'instance'")
+		return
+	}
+	name := r.PathValue("name")
+	ctx := r.Context()
+
+	cr, err := h.mgr.GetCanary(ctx, name, cfgType)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if cr == nil {
+		notFound(w)
+		return
+	}
+
+	agents, err := h.mgr.ListAgents(ctx)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+
+	// Each InstanceID uniquely identifies a running agent process — no deduplication needed.
+	result := make([]canaryAgentResp, 0, len(agents))
+
+	for _, agent := range agents {
+		var tagEntries []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}
+		var tags []model.AgentGroupTag
+		if agent.TagsJSON != "" {
+			if err2 := json.Unmarshal([]byte(agent.TagsJSON), &tagEntries); err2 == nil {
+				tags = make([]model.AgentGroupTag, 0, len(tagEntries))
+				for _, e := range tagEntries {
+					tags = append(tags, model.AgentGroupTag{TagName: e.Name, TagValue: e.Value})
+				}
+			}
+		}
+
+		match := model.AgentMatchContext{
+			InstanceID: agent.InstanceID,
+			IP:         agent.IP,
+			Hostid:     agent.Hostid,
+			Hostname:   agent.Hostname,
+			Version:    agent.Version,
+			Tags:       tags,
+		}
+
+		bucket := "unknown"
+		bkt, hasBucket := model.CanaryBucket(match, name)
+		if hasBucket {
+			targeted, err2 := model.CanaryTargeted(cr, match)
+			if err2 != nil {
+				internalError(w, err2)
+				return
+			}
+			if !targeted {
+				bucket = "not_targeted"
+			} else if bkt < cr.RolloutPercent {
+				bucket = "canary"
+			} else {
+				bucket = "stable"
+			}
+		}
+
+		entry := canaryAgentResp{
+			InstanceID: agent.InstanceID,
+			AgentType:  agent.AgentType,
+			IP:         agent.IP,
+			Hostname:   agent.Hostname,
+			Version:    agent.Version,
+			Tags:       tagEntries,
+			Bucket:     bucket,
+		}
+		result = append(result, entry)
+	}
+
+	ok(w, result)
 }

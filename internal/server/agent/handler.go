@@ -88,11 +88,12 @@ func (h *AgentHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve configs for this agent based on its tags and attributes.
 	match := model.AgentMatchContext{
-		IP:       agent.IP,
-		Hostid:   agent.Hostid,   // machine-stable OTel host.id; used for canary bucketing
-		Hostname: agent.Hostname, // fallback when Hostid is not populated
-		Version:  agent.Version,
-		Tags:     protoTagsToModel(req.Tags),
+		InstanceID: instanceID, // unique per agent process — preferred canary bucket key
+		IP:         agent.IP,
+		Hostid:     agent.Hostid,   // machine-stable OTel host.id; fallback bucket key
+		Hostname:   agent.Hostname, // last-resort fallback when Hostid is not populated
+		Version:    agent.Version,
+		Tags:       protoTagsToModel(req.Tags),
 	}
 	pipelines, instances, onetimes, err := h.mgr.GetConfigsForAgent(ctx, match)
 	if err != nil {

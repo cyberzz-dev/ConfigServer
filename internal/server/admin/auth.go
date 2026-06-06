@@ -206,6 +206,8 @@ func initSessionStore(rdb redis.UniversalClient) {
 	if rdb != nil {
 		sessions = &redisSessionStore{rdb: rdb}
 	}
+	initPendingOTPStore(rdb)
+	initResetStore(rdb)
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -213,10 +215,13 @@ func initSessionStore(rdb redis.UniversalClient) {
 // authPublicPaths lists exact /api/v1 paths that do NOT require a session.
 // All other /api/v1/... paths (including /api/v1/auth/change-password) are protected.
 var authPublicPaths = map[string]bool{
-	"/api/v1/auth/status": true,
-	"/api/v1/auth/init":   true,
-	"/api/v1/auth/login":  true,
-	"/api/v1/auth/logout": true,
+	"/api/v1/auth/status":          true,
+	"/api/v1/auth/init":            true,
+	"/api/v1/auth/login":           true,
+	"/api/v1/auth/login/otp":       true,
+	"/api/v1/auth/logout":          true,
+	"/api/v1/auth/forgot-password": true,
+	"/api/v1/auth/reset-password":  true,
 }
 
 // csrfSafeMethods are HTTP methods that do not mutate state and therefore do
@@ -396,6 +401,9 @@ func (h *AdminHandler) AuthInit(w http.ResponseWriter, r *http.Request) {
 
 // AuthLogin validates credentials and issues a session cookie.
 // Accepts {username, password}; username defaults to "admin" when omitted.
+// When TOTP is enabled for the user, instead of a session cookie the response
+// carries {otp_required: true, pending_token: "..."} and the client must
+// complete the login via POST /api/v1/auth/login/otp.
 //
 //	POST /api/v1/auth/login
 func (h *AdminHandler) AuthLogin(w http.ResponseWriter, r *http.Request) {
@@ -424,6 +432,16 @@ func (h *AdminHandler) AuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(body.Password)); err != nil {
 		writeJSON(w, http.StatusUnauthorized, 401, "invalid credentials", nil)
+		return
+	}
+
+	// TOTP second factor: if enabled, do not issue a full session yet.
+	if user.TOTPEnabled {
+		pendingToken := pendingOTP.issue(ctx, body.Username)
+		ok(w, map[string]any{
+			"otp_required":  true,
+			"pending_token": pendingToken,
+		})
 		return
 	}
 
@@ -550,4 +568,19 @@ func newCSRFCookie(token string) *http.Cookie {
 		HttpOnly: false, // must be readable by JS
 		SameSite: http.SameSiteStrictMode,
 	}
+}
+
+// bcryptCompare wraps bcrypt.CompareHashAndPassword as a named function so
+// otp.go can call it without importing golang.org/x/crypto/bcrypt directly.
+func bcryptCompare(hash, password []byte) error {
+	return bcrypt.CompareHashAndPassword(hash, password)
+}
+
+// hashPassword bcrypt-hashes a plain-text password.
+func hashPassword(plain string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(plain), bcryptCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
 }

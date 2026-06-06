@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom'
-import { Layout, Breadcrumb, Tooltip, Modal, Form, Input, Button, message, Dropdown, Avatar, Space, ConfigProvider, theme as antdTheme } from 'antd'
+import { Layout, Breadcrumb, Tooltip, Modal, Form, Input, Button, message, Dropdown, Avatar, Space, ConfigProvider, theme as antdTheme, Spin, Steps, Alert, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   MenuFoldOutlined,
@@ -20,16 +20,18 @@ import {
   MoonOutlined,
   DesktopOutlined,
   ExperimentOutlined,
+  SafetyCertificateOutlined,
+  QrcodeOutlined,
 } from '@ant-design/icons'
-import ConfigsPage from './pages/ConfigsPage'
-import GroupsPage from './pages/GroupsPage'
-import AgentsPage from './pages/AgentsPage'
-import UsersPage from './pages/UsersPage'
-import RolesPage from './pages/RolesPage'
-import AuditPage from './pages/AuditPage'
-import LoginPage from './pages/LoginPage'
-import CanaryPage from './pages/CanaryPage'
-import { getAuthStatus, logout, changePassword, getMe } from './api'
+const ConfigsPage = lazy(() => import('./pages/ConfigsPage'))
+const GroupsPage  = lazy(() => import('./pages/GroupsPage'))
+const AgentsPage  = lazy(() => import('./pages/AgentsPage'))
+const UsersPage   = lazy(() => import('./pages/UsersPage'))
+const RolesPage   = lazy(() => import('./pages/RolesPage'))
+const AuditPage   = lazy(() => import('./pages/AuditPage'))
+const LoginPage   = lazy(() => import('./pages/LoginPage'))
+const CanaryPage  = lazy(() => import('./pages/CanaryPage'))
+import { getAuthStatus, logout, changePassword, getMe, otpSetup, otpEnable, otpDisable, type OTPSetupResponse } from './api'
 import { PermissionProvider, useCurrentUser, useLoadMe } from './PermissionContext'
 
 const { Header, Sider, Content } = Layout
@@ -182,6 +184,14 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
   const [changePwdOpen, setChangePwdOpen] = useState(false)
   const [changePwdLoading, setChangePwdLoading] = useState(false)
   const [form] = Form.useForm()
+  // TOTP modal state
+  const [totpOpen, setTotpOpen] = useState(false)
+  const [totpStep, setTotpStep] = useState<'menu' | 'setup' | 'disable'>('menu')
+  const [totpSetupData, setTotpSetupData] = useState<OTPSetupResponse | null>(null)
+  const [totpLoading, setTotpLoading] = useState(false)
+  const [totpError, setTotpError] = useState('')
+  const [totpForm] = Form.useForm()
+  const [totpDisableForm] = Form.useForm()
   const location = useLocation()
   const crumbs = BREADCRUMB_MAP[location.pathname] ?? []
   const currentUser = useCurrentUser()
@@ -203,9 +213,51 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
     }
   }
 
+  const openTotpModal = () => { setTotpOpen(true); setTotpStep('menu'); setTotpError(''); setTotpSetupData(null) }
+  const closeTotpModal = () => { setTotpOpen(false); totpForm.resetFields(); totpDisableForm.resetFields(); setTotpSetupData(null); setTotpError('') }
+
+  const startTotpSetup = async () => {
+    setTotpLoading(true); setTotpError('')
+    try {
+      const data = await otpSetup()
+      setTotpSetupData(data)
+      setTotpStep('setup')
+    } catch (e: any) {
+      setTotpError(e?.response?.data?.message ?? 'Failed to generate QR code')
+    } finally {
+      setTotpLoading(false)
+    }
+  }
+
+  const confirmTotpEnable = async (values: { otp_code: string }) => {
+    setTotpLoading(true); setTotpError('')
+    try {
+      await otpEnable(values.otp_code)
+      message.success('Two-factor authentication enabled')
+      closeTotpModal()
+    } catch (e: any) {
+      setTotpError(e?.response?.data?.message ?? 'Invalid code, please try again')
+    } finally {
+      setTotpLoading(false)
+    }
+  }
+
+  const confirmTotpDisable = async (values: { password: string }) => {
+    setTotpLoading(true); setTotpError('')
+    try {
+      await otpDisable(values.password)
+      message.success('Two-factor authentication disabled')
+      closeTotpModal()
+    } catch (e: any) {
+      setTotpError(e?.response?.data?.message ?? 'Failed to disable 2FA')
+    } finally {
+      setTotpLoading(false)
+    }
+  }
+
   return (
     <>
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout style={{ height: '100vh', overflow: 'hidden' }}>
       {/* Top navigation bar */}
       <Header style={{
         display: 'flex',
@@ -233,8 +285,12 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
             ? <MenuUnfoldOutlined style={{ fontSize: 16 }} />
             : <MenuFoldOutlined  style={{ fontSize: 16 }} />}
         </div>
-        <span style={{ color: theme === 'dark' ? '#ffffff' : '#000000', fontSize: 15, fontWeight: 700, letterSpacing: '0.02em', userSelect: 'none' }}>
-          LoongCollector Config Server
+        <span style={{ fontSize: 15, fontWeight: 700, letterSpacing: '0.02em', userSelect: 'none' }}>
+          <span className="brand-title" aria-label="LoongCollector Config Server">
+            <span className="brand-title-word-1">LoongCollector</span>
+            <span className="brand-title-word-2">Config</span>
+            <span className="brand-title-word-3">Server</span>
+          </span>
         </span>
         <div style={{ marginLeft: 'auto' }}>
           <Space size={2}>
@@ -261,6 +317,7 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
               </div>
             </Tooltip>
             <div style={{ width: 1, height: 22, background: theme === 'dark' ? '#5f6368' : '#d9d9d9', margin: '0 8px' }} />
+            <ConfigProvider theme={{ algorithm: theme === 'dark' ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm }}>
             <Dropdown
               menu={{
                 items: [
@@ -270,11 +327,17 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
                     label: 'Change Password',
                     onClick: () => setChangePwdOpen(true),
                   },
+                  {
+                    key: 'two-factor',
+                    icon: <SafetyCertificateOutlined />,
+                    label: 'Two-Factor Auth',
+                    onClick: openTotpModal,
+                  },
                   { type: 'divider' },
                   {
                     key: 'logout',
-                    icon: <LogoutOutlined />,
-                    label: 'Sign Out',
+                    icon: <LogoutOutlined style={theme === 'dark' ? { color: '#ff7875' } : undefined} />,
+                    label: <span style={theme === 'dark' ? { color: '#ff7875' } : undefined}>Sign Out</span>,
                     onClick: onLogout,
                     danger: true,
                   },
@@ -296,11 +359,12 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
                 )}
               </Space>
             </Dropdown>
+            </ConfigProvider>
           </Space>
         </div>
       </Header>
 
-      <Layout>
+      <Layout style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
         <Sider
           collapsed={collapsed}
           width={220}
@@ -308,16 +372,14 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
           style={{
             background: theme === 'dark' ? '#292a2d' : '#fafafa',
             borderRight: theme === 'dark' ? '1px solid #3c4043' : '1px solid #f0f0f0',
-            position: 'sticky',
-            top: 48,
-            height: 'calc(100vh - 48px)',
+            height: '100%',
             overflowY: 'auto',
           }}
         >
           <SideNav collapsed={collapsed} theme={theme} />
         </Sider>
 
-        <Layout style={{ background: theme === 'dark' ? '#202124' : '#f0f0f0', flexDirection: 'column', height: 'calc(100vh - 48px)', overflow: 'hidden' }}>
+        <Layout style={{ background: theme === 'dark' ? '#202124' : '#f0f0f0', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}>
           {/* Breadcrumb bar */}
           <div style={{
             padding: '8px 24px',
@@ -343,8 +405,10 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
               padding: '20px 24px',
               border: theme === 'dark' ? '1px solid #3c4043' : '1px solid #f0f0f0',
               boxShadow: theme === 'dark' ? '0 1px 6px rgba(0,0,0,.35)' : '0 1px 4px rgba(0,0,0,.08)',
-              minHeight: 'calc(100vh - 125px)',
+              minHeight: 0,
             }}>
+              <Suspense fallback={<div style={{ textAlign: 'center', padding: 60 }}><Spin size="large" /></div>}>
+              <div key={location.pathname} className="page-transition">
               <Routes>
                 <Route path="/"                  element={<Navigate to="/pipeline-configs" replace />} />
                 <Route path="/pipeline-configs"  element={<ConfigsPage tab="pipeline" />} />
@@ -357,6 +421,8 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
                 <Route path="/roles"             element={<RolesPage />} />
                 <Route path="/audit"             element={<AuditPage />} />
               </Routes>
+              </div>
+              </Suspense>
             </div>
           </Content>
         </Layout>
@@ -410,6 +476,126 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
           <Button type="primary" htmlType="submit" loading={changePwdLoading}>Change Password</Button>
         </Form.Item>
       </Form>
+    </Modal>
+
+    {/* TOTP / Two-Factor Auth Modal */}
+    <Modal
+      title={<Space><SafetyCertificateOutlined />Two-Factor Authentication</Space>}
+      open={totpOpen}
+      onCancel={closeTotpModal}
+      footer={null}
+      destroyOnClose
+      width={480}
+    >
+      {totpError && (
+        <Alert type="error" message={totpError} showIcon closable onClose={() => setTotpError('')}
+          style={{ marginBottom: 16 }} />
+      )}
+
+      {/* Menu: choose setup or disable */}
+      {totpStep === 'menu' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: '8px 0' }}>
+          <Button
+            type="primary"
+            icon={<QrcodeOutlined />}
+            block
+            size="large"
+            loading={totpLoading}
+            onClick={startTotpSetup}
+          >
+            Set Up / Reset Two-Factor Auth
+          </Button>
+          <Button
+            danger
+            block
+            size="large"
+            onClick={() => { setTotpStep('disable'); setTotpError('') }}
+          >
+            Disable Two-Factor Auth
+          </Button>
+          <Button block onClick={closeTotpModal}>Cancel</Button>
+        </div>
+      )}
+
+      {/* Setup: show QR code then ask for confirmation code */}
+      {totpStep === 'setup' && totpSetupData && (
+        <div>
+          <Steps
+            size="small"
+            current={1}
+            items={[
+              { title: 'Scan QR Code' },
+              { title: 'Confirm Code' },
+            ]}
+            style={{ marginBottom: 20 }}
+          />
+          <Typography.Paragraph type="secondary" style={{ fontSize: 13, marginBottom: 12 }}>
+            Scan the QR code below with Google Authenticator, Authy, or any TOTP app.
+            Then enter the 6-digit code to confirm.
+          </Typography.Paragraph>
+          {totpSetupData.qr_code ? (
+            <div style={{ textAlign: 'center', marginBottom: 16 }}>
+              <img
+                src={totpSetupData.qr_code}
+                alt="TOTP QR Code"
+                style={{ width: 200, height: 200, border: '1px solid #f0f0f0', borderRadius: 8 }}
+              />
+            </div>
+          ) : null}
+          <Typography.Paragraph
+            copyable
+            style={{ fontFamily: 'monospace', fontSize: 13, textAlign: 'center', background: theme === 'dark' ? '#3c4043' : '#f5f5f5', color: theme === 'dark' ? '#e8eaed' : '#262626', padding: '6px 10px', borderRadius: 6 }}
+          >
+            {totpSetupData.secret}
+          </Typography.Paragraph>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            Can't scan? Enter the code above manually in your authenticator app.
+          </Typography.Text>
+          <Form form={totpForm} layout="vertical" onFinish={confirmTotpEnable}
+            requiredMark={false} style={{ marginTop: 16 }}>
+            <Form.Item
+              label="Verification Code"
+              name="otp_code"
+              rules={[
+                { required: true, message: 'Enter the 6-digit code from your app' },
+                { pattern: /^\d{6}$/, message: 'Must be exactly 6 digits' },
+              ]}
+            >
+              <Input
+                placeholder="123456"
+                maxLength={6}
+                autoFocus
+                style={{ letterSpacing: '0.3em', fontSize: 18, textAlign: 'center' }}
+              />
+            </Form.Item>
+            <Form.Item style={{ marginBottom: 0, textAlign: 'right' }}>
+              <Button onClick={() => { setTotpStep('menu'); totpForm.resetFields(); setTotpError('') }} style={{ marginRight: 8 }}>Back</Button>
+              <Button type="primary" htmlType="submit" loading={totpLoading}>Enable 2FA</Button>
+            </Form.Item>
+          </Form>
+        </div>
+      )}
+
+      {/* Disable: require current password */}
+      {totpStep === 'disable' && (
+        <Form form={totpDisableForm} layout="vertical" onFinish={confirmTotpDisable}
+          requiredMark={false}>
+          <Typography.Paragraph type="secondary" style={{ fontSize: 13 }}>
+            Enter your current password to disable two-factor authentication.
+          </Typography.Paragraph>
+          <Form.Item
+            label="Current Password"
+            name="password"
+            rules={[{ required: true, message: 'Password is required' }]}
+          >
+            <Input.Password autoFocus />
+          </Form.Item>
+          <Form.Item style={{ marginBottom: 0, textAlign: 'right' }}>
+            <Button onClick={() => { setTotpStep('menu'); totpDisableForm.resetFields(); setTotpError('') }} style={{ marginRight: 8 }}>Back</Button>
+            <Button danger htmlType="submit" loading={totpLoading}>Disable 2FA</Button>
+          </Form.Item>
+        </Form>
+      )}
     </Modal>
     </>
   )
@@ -477,10 +663,17 @@ export default function App() {
     return () => window.removeEventListener('cs:unauthorized', handler)
   }, [])
 
+  // Dispatch app:ready once auth state is resolved (removes splash screen)
+  useEffect(() => {
+    if (authed !== null) {
+      window.dispatchEvent(new Event('app:ready'))
+    }
+  }, [authed])
+
   if (authed === null) return null // brief loading state
 
   if (!authed) {
-    return <LoginPage onLoggedIn={() => setAuthed(true)} />
+    return <Suspense fallback={null}><LoginPage onLoggedIn={() => setAuthed(true)} /></Suspense>
   }
 
   return (

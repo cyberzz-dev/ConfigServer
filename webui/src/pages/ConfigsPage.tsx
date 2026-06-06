@@ -273,7 +273,7 @@ function DiffModal({
 
 function PipelinePanel() {
   const [configs, setConfigs] = useState<Config[]>([])
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState<Config | null>(null)
   const [detail, setDetail] = useState('')
@@ -567,7 +567,7 @@ function PipelinePanel() {
 
 function InstancePanel() {
   const [configs, setConfigs] = useState<Config[]>([])
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState<Config | null>(null)
   const [detail, setDetail] = useState('')
@@ -858,7 +858,7 @@ function InstancePanel() {
 
 function OnetimePanel() {
   const [cmds, setCmds] = useState<OnetimeCommand[]>([])
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [open, setOpen] = useState(false)
   const [detail, setDetail] = useState('')
   const [viewTarget, setViewTarget] = useState<OnetimeCommand | null>(null)

@@ -30,15 +30,20 @@ type CanaryTagSelector struct {
 	Tags []CanaryTag `json:"tags"`
 }
 
-// stableKey returns the per-host stable identity used for canary bucketing.
+// stableKey returns the per-agent stable identity used for canary bucketing.
 //
 // Priority order:
-//  1. Hostid  — OTel host.id, machine-level, survives process restarts (preferred)
-//  2. Hostname — falls back to hostname when host.id is not populated
+//  1. InstanceID — unique per agent process (preferred; two agents on the same
+//     host receive independent buckets)
+//  2. Hostid     — OTel host.id, machine-level (legacy fallback)
+//  3. Hostname   — last-resort fallback when neither above is populated
 //
 // Returns (key, true) when a stable key is available, ("", false) otherwise.
 // Callers that receive ok=false must skip canary delivery and serve the stable version.
 func stableKey(m AgentMatchContext) (string, bool) {
+	if m.InstanceID != "" {
+		return m.InstanceID, true
+	}
 	if m.Hostid != "" {
 		return m.Hostid, true
 	}
@@ -101,6 +106,32 @@ func CanaryMatchesTags(tagSelectorJSON string, tags []AgentGroupTag) (bool, erro
 		}
 	}
 	return false, nil
+}
+
+// CanaryTargeted reports whether an agent falls within the canary's targeting
+// scope: version constraint, IP selector, and tag selector must all pass (AND).
+// It does NOT evaluate the percentage bucket.
+//
+// This is distinct from CanaryEligible: an agent may be targeted but still land
+// in the stable bucket (bucket >= RolloutPercent). Callers that need to distinguish
+// "outside targeting scope" from "in stable bucket" should call CanaryTargeted
+// first, then CanaryBucket separately.
+func CanaryTargeted(cr *CanaryRelease, m AgentMatchContext) (bool, error) {
+	if cr.VersionConstraint != "" && !MatchVersionConstraint(cr.VersionConstraint, m.Version) {
+		return false, nil
+	}
+	ipOK, err := CanaryMatchesIP(cr.IPSelectorJSON, m.IP)
+	if err != nil {
+		return false, err
+	}
+	if !ipOK {
+		return false, nil
+	}
+	tagOK, err := CanaryMatchesTags(cr.TagSelectorJSON, m.Tags)
+	if err != nil {
+		return false, err
+	}
+	return tagOK, nil
 }
 
 // CanaryEligible reports whether an agent is eligible to receive the canary

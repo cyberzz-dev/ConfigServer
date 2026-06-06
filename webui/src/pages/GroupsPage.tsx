@@ -98,7 +98,9 @@ function deleteSnapshotToText(detail: string): string {
 
 export default function GroupsPage() {
   const [groups, setGroups] = useState<AgentGroup[]>([])
-  const [loading, setLoading] = useState(false)
+  const [sortField, setSortField] = useState<string>('Name')
+  const [sortOrder, setSortOrder] = useState<'ascend' | 'descend' | null>('ascend')
+  const [loading, setLoading] = useState(true)
   const [createOpen, setCreateOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<AgentGroup | null>(null)
   const [tagsGroup, setTagsGroup] = useState<AgentGroup | null>(null)
@@ -130,7 +132,10 @@ export default function GroupsPage() {
   const [recycleConfirmItem, setRecycleConfirmItem] = useState<ConfigHistory | null>(null)
   const [recycleDiffCurrent, setRecycleDiffCurrent] = useState('')
   const [recycleDiffLoading, setRecycleDiffLoading] = useState(false)
-  const [groupMeta, setGroupMeta] = useState<Record<string, { tagCount?: number; ipSelectorCount?: number; configCount?: number }>>({})
+  const [groupMeta, setGroupMeta] = useState<Record<string, {
+    tagCount?: number; ipSelectorCount?: number;
+    pipelineCount?: number; instanceCount?: number; onetimeCount?: number;
+  }>>({})
   const [form] = Form.useForm()
   const [tagsForm] = Form.useForm()
   const [ipSelectorForm] = Form.useForm()
@@ -147,15 +152,21 @@ export default function GroupsPage() {
           getGroupIPSelector(g.Name),
           getGroupConfigs(g.Name),
         ])
+        const cfgs = configsResult.status === 'fulfilled' ? configsResult.value : []
         return {
           name: g.Name,
           tagCount: tagsResult.status === 'fulfilled' ? tagsResult.value.length : 0,
           ipSelectorCount: ipSelectorResult.status === 'fulfilled' ? ipSelectorResult.value.ips.length : parseIPSelectorLines(g.IPSelectorJSON).length,
-          configCount: configsResult.status === 'fulfilled' ? configsResult.value.length : 0,
+          pipelineCount: cfgs.filter(c => c.ConfigType === 'pipeline').length,
+          instanceCount: cfgs.filter(c => c.ConfigType === 'instance').length,
+          onetimeCount: cfgs.filter(c => c.ConfigType === 'onetime').length,
         }
       })
     )
-    const meta: Record<string, { tagCount?: number; ipSelectorCount?: number; configCount?: number }> = {}
+    const meta: Record<string, {
+      tagCount?: number; ipSelectorCount?: number;
+      pipelineCount?: number; instanceCount?: number; onetimeCount?: number;
+    }> = {}
     results.forEach(r => { meta[r.name] = r })
     setGroupMeta(meta)
   }
@@ -372,7 +383,12 @@ export default function GroupsPage() {
     const c = await getGroupConfigs(configsGroup!.Name)
     setConfigs(c)
     const name = configsGroup!.Name
-    setGroupMeta(prev => ({ ...prev, [name]: { ...prev[name], configCount: c.length } }))
+    setGroupMeta(prev => ({ ...prev, [name]: {
+      ...prev[name],
+      pipelineCount: c.filter(m => m.ConfigType === 'pipeline').length,
+      instanceCount: c.filter(m => m.ConfigType === 'instance').length,
+      onetimeCount: c.filter(m => m.ConfigType === 'onetime').length,
+    } }))
   }
 
   const loadAvailableConfigs = async (type: string) => {
@@ -401,13 +417,18 @@ export default function GroupsPage() {
     const c = await getGroupConfigs(configsGroup!.Name)
     setConfigs(c)
     const name = configsGroup!.Name
-    setGroupMeta(prev => ({ ...prev, [name]: { ...prev[name], configCount: c.length } }))
+    setGroupMeta(prev => ({ ...prev, [name]: {
+      ...prev[name],
+      pipelineCount: c.filter(m => m.ConfigType === 'pipeline').length,
+      instanceCount: c.filter(m => m.ConfigType === 'instance').length,
+      onetimeCount: c.filter(m => m.ConfigType === 'onetime').length,
+    } }))
   }
 
   const baseColumns = [
     { title: 'Name', dataIndex: 'Name', key: 'Name', width: 200, ellipsis: true,
-      sorter: (a: AgentGroup, b: AgentGroup) => a.Name.localeCompare(b.Name),
-      defaultSortOrder: 'ascend' as const,
+      sorter: true,
+      sortOrder: sortField === 'Name' ? (sortOrder || undefined) : undefined,
       render: (name: string) => (
         <Space size={6}>
           {name}
@@ -417,7 +438,8 @@ export default function GroupsPage() {
     },
     { title: 'Description', dataIndex: 'Description', key: 'Description', width: 260, ellipsis: true },
     { title: 'Updated At', dataIndex: 'UpdatedAt', key: 'UpdatedAt', width: 170,
-      sorter: (a: AgentGroup, b: AgentGroup) => (a.UpdatedAt ?? '').localeCompare(b.UpdatedAt ?? ''),
+      sorter: true,
+      sortOrder: sortField === 'UpdatedAt' ? (sortOrder || undefined) : undefined,
       render: (v: string) => v ? dayjs(v).format('YYYY-MM-DD HH:mm:ss') : '—' },
     {
       title: 'Actions', key: 'actions', width: 330,
@@ -443,10 +465,18 @@ export default function GroupsPage() {
             {record.VersionConstraint ? `Ver: ${record.VersionConstraint}` : 'Version'}
           </Button>
           <Button size="small" onClick={() => openConfigs(record)}
-            style={groupMeta[record.Name]?.configCount
-              ? { borderColor: '#1677ff', color: '#1677ff' }
-              : { color: '#bfbfbf', borderColor: '#d9d9d9' }}>
-            {`Configs (${String(groupMeta[record.Name]?.configCount ?? '\u2026').padEnd(2, '\u00A0')})`}
+            style={(() => {
+              const m = groupMeta[record.Name]
+              const total = (m?.pipelineCount ?? 0) + (m?.instanceCount ?? 0) + (m?.onetimeCount ?? 0)
+              return total > 0
+                ? { borderColor: '#1677ff', color: '#1677ff' }
+                : { color: '#bfbfbf', borderColor: '#d9d9d9' }
+            })()}>
+            {(() => {
+              const m = groupMeta[record.Name]
+              if (!m || m.pipelineCount === undefined) return 'Configs (\u2026)'
+              return `pipeline(${m.pipelineCount}) instance(${m.instanceCount ?? 0}) onetime(${m.onetimeCount ?? 0})`
+            })()}
           </Button>
           {canDelete && record.Name !== 'default' && (
             <Button size="small" danger onClick={() => { setSelectedRow(record.Name); setDeleteTarget(record.Name) }}>Delete</Button>
@@ -457,6 +487,39 @@ export default function GroupsPage() {
     },
   ]
   const columns = useResizableColumns(baseColumns)
+
+  // Compute sorted groups: 'default' always first, others sorted by user selection
+  const sortedGroups = (() => {
+    const defaultGroup = groups.find(g => g.Name === 'default')
+    let otherGroups = groups.filter(g => g.Name !== 'default')
+    
+    // Apply sorting only when user has selected a sort order
+    if (sortOrder && sortField) {
+      otherGroups = [...otherGroups].sort((a, b) => {
+        let result = 0
+        if (sortField === 'Name') {
+          result = a.Name.localeCompare(b.Name)
+        } else if (sortField === 'UpdatedAt') {
+          result = (a.UpdatedAt ?? '').localeCompare(b.UpdatedAt ?? '')
+        }
+        return sortOrder === 'descend' ? -result : result
+      })
+    }
+    
+    return defaultGroup ? [defaultGroup, ...otherGroups] : otherGroups
+  })()
+
+  const handleTableChange = (_pagination: any, _filters: any, sorter: any) => {
+    // Handle both single column sort and multi-column sort (sorter could be an array)
+    const currentSorter = Array.isArray(sorter) ? sorter[0] : sorter
+    if (currentSorter && currentSorter.column) {
+      setSortField(currentSorter.columnKey || currentSorter.field)
+      setSortOrder(currentSorter.order || null)
+    } else {
+      // No active sorting
+      setSortOrder(null)
+    }
+  }
 
   return (
     <>
@@ -473,10 +536,12 @@ export default function GroupsPage() {
         rowKey="Name"
         components={tableComponents}
         columns={columns}
-        dataSource={groups}
+        dataSource={sortedGroups}
         loading={loading}
+        showSorterTooltip={false}
         size="small"
         scroll={{ x: 'max-content' }}
+        onChange={handleTableChange}
         onRow={r => ({
           onClick: () => setSelectedRow(prev => prev === r.Name ? undefined : r.Name),
           style: { cursor: 'pointer' },

@@ -10,8 +10,8 @@
 # ============================================================
 
 # ── Database ─────────────────────────────────────────────────
-# Distributed mode requires MySQL. SQLite is not supported here
-# because multiple processes must share the same database.
+# Distributed mode requires MySQL or PostgreSQL.
+# SQLite is not supported here because multiple processes must share the same database.
 database:
   driver: mysql
   # MySQL DSN format:
@@ -21,7 +21,10 @@ database:
   #   parseTime=True   — map DATETIME → time.Time
   #   loc=Local        — use server local timezone
   dsn: "configserver:s3cr3t@tcp(mysql:3306)/configserver?charset=utf8mb4&parseTime=True&loc=Local"
-  # Connection pool (applies to both SQLite and MySQL)
+  # PostgreSQL (16+) example — switch driver to "postgres" and update DSN:
+  # driver: postgres
+  # dsn: "host=postgres port=5432 user=configserver password=s3cr3t dbname=configserver sslmode=disable TimeZone=UTC"
+  # Connection pool (applies to both MySQL and PostgreSQL)
   pool:
     max_open_conns:    25    # max concurrent connections
     max_idle_conns:    10    # idle connections to keep open
@@ -31,9 +34,20 @@ database:
 # Required in distributed mode for L2 cache and pub/sub
 # invalidation between admin and configserver processes.
 redis:
-  addr: "redis:6379"   # host:port; for Redis Cluster list comma-separated addrs
+  # Standalone / Sentinel mode: single address.
+  addr: "redis:6379"
+  # Redis Cluster mode: use addrs (YAML list) instead of addr.
+  # When addrs contains more than one entry the client automatically
+  # operates in cluster mode; the db field is ignored by the cluster.
+  # addrs:
+  #   - "redis-node1:6379"
+  #   - "redis-node2:6379"
+  #   - "redis-node3:6379"
   password: ""          # Redis AUTH password; empty = no auth
-  db: 0                 # Redis logical database index (0–15)
+  db: 0                 # Redis logical database index (0–15); ignored in cluster mode
+  # hfe: true           # Hash Field Expiry — requires Valkey 9.0+ or Redis 7.4+.
+  #                     # When enabled each config-status field gets its own TTL
+  #                     # (HEXPIRE) so stale per-config entries expire independently.
 
 # ── In-process cache (L1 freecache) ──────────────────────────
 cache:
@@ -59,3 +73,15 @@ metrics:
   push_url: ""                 # e.g. "http://vmagent:8429/api/v1/import/prometheus"
   push_interval: 30s
   online_window: 5m            # Agents silent longer than this are counted as offline
+
+# ── SMTP (optional) — password-reset emails ─────────────────────
+# Leave smtp.host empty to disable email-based password reset.
+smtp:
+  host: ""                     # SMTP server hostname, e.g. "smtp.example.com"
+  port: 587                    # 587 = STARTTLS, 465 = implicit TLS, 25 = plain
+  username: ""                 # SMTP auth username
+  password: ""                 # SMTP auth password
+  from: "noreply@example.com" # Sender address in outgoing emails
+  tls: false                   # true = implicit TLS (port 465); false = STARTTLS/plain
+  public_url: ""               # Base URL of the admin UI, e.g. "https://admin.example.com"
+                               # Used to build the clickable reset link in emails.

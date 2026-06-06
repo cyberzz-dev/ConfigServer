@@ -13,14 +13,17 @@
 
 # ── Database ─────────────────────────────────────────────────
 database:
-  # driver: sqlite | mysql
+  # driver: sqlite | mysql | postgres
   driver: sqlite
   # SQLite: path to the database file.
   dsn: configserver.db
   # MySQL example (uncomment and switch driver to "mysql"):
   # driver: mysql
   # dsn: "user:password@tcp(127.0.0.1:3306)/configserver?charset=utf8mb4&parseTime=True&loc=Local"
-  # Connection pool (applies to both SQLite and MySQL)
+  # PostgreSQL (16+) example (uncomment and switch driver to "postgres"):
+  # driver: postgres
+  # dsn: "host=127.0.0.1 port=5432 user=configserver password=s3cr3t dbname=configserver sslmode=disable TimeZone=UTC"
+  # Connection pool (applies to SQLite, MySQL and PostgreSQL)
   pool:
     max_open_conns:    25    # max concurrent connections
     max_idle_conns:    10    # idle connections to keep open
@@ -31,8 +34,14 @@ database:
 # Uncomment to enable L2 caching (useful if you later scale out).
 redis:
   addr: ""         # e.g. "127.0.0.1:6379"  — leave empty to disable
+  # Redis Cluster mode: use addrs (YAML list) instead of addr.
+  # addrs:
+  #   - "redis-node1:6379"
+  #   - "redis-node2:6379"
+  #   - "redis-node3:6379"
   password: ""     # Redis AUTH password; empty = no auth
-  db: 0            # Redis logical database index (0–15)
+  db: 0            # Redis logical database index (0–15); ignored in cluster mode
+  # hfe: true      # Hash Field Expiry — requires Valkey 9.0+ or Redis 7.4+.
 
 # ── In-process cache (L1 freecache) ──────────────────────────
 cache:
@@ -61,3 +70,14 @@ metrics:
   push_url: ""                 # e.g. "http://vmagent:8429/api/v1/import/prometheus"
   push_interval: 30s           # How often to push metrics to push_url
   online_window: 5m            # Agents with heartbeat older than this are counted as offline
+
+# ── SMTP (optional) — password-reset emails ─────────────────────
+# Leave smtp.host empty to disable email-based password reset.
+smtp:
+  host: ""                     # SMTP server hostname, e.g. "smtp.example.com"
+  port: 587                    # 587 = STARTTLS, 465 = implicit TLS, 25 = plain
+  username: ""                 # SMTP auth username
+  password: ""                 # SMTP auth password
+  from: "noreply@example.com" # Sender address in outgoing emails
+  tls: false                   # true = implicit TLS (port 465); false = STARTTLS/plain
+  public_url: ""               # Base URL of the admin UI used to build reset links

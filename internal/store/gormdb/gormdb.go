@@ -7,8 +7,8 @@
 //      http://www.apache.org/licenses/LICENSE-2.0
 
 // Package gormdb implements store.Store using GORM.
-// It supports both SQLite (via github.com/glebarez/sqlite, CGO_ENABLED=0)
-// and MySQL (via gorm.io/driver/mysql).
+// It supports SQLite (via github.com/glebarez/sqlite, CGO_ENABLED=0),
+// MySQL (via gorm.io/driver/mysql), and PostgreSQL (via gorm.io/driver/postgres).
 package gormdb
 
 import (
@@ -22,6 +22,7 @@ import (
 	"github.com/alibaba/ilogtail/config_server/internal/store"
 	glebarezSQLite "github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -43,8 +44,9 @@ type PoolConfig struct {
 
 // New opens (or creates) the database and runs AutoMigrate.
 //
-//   - driver "sqlite"  → pure-Go SQLite via github.com/glebarez/sqlite
-//   - driver "mysql"   → MySQL via gorm.io/driver/mysql
+//   - driver "sqlite"     → pure-Go SQLite via github.com/glebarez/sqlite
+//   - driver "mysql"      → MySQL via gorm.io/driver/mysql
+//   - driver "postgres"   → PostgreSQL (16+) via gorm.io/driver/postgres (pgx/v5)
 func New(driver, dsn string, pool PoolConfig) (*Store, error) {
 	var dialector gorm.Dialector
 	switch driver {
@@ -52,8 +54,10 @@ func New(driver, dsn string, pool PoolConfig) (*Store, error) {
 		dialector = glebarezSQLite.Open(dsn)
 	case "mysql":
 		dialector = mysql.Open(dsn)
+	case "postgres", "postgresql":
+		dialector = postgres.Open(dsn)
 	default:
-		return nil, fmt.Errorf("unsupported db driver: %s", driver)
+		return nil, fmt.Errorf("unsupported db driver: %s (supported: sqlite, mysql, postgres)", driver)
 	}
 
 	db, err := gorm.Open(dialector, &gorm.Config{
@@ -79,6 +83,9 @@ func New(driver, dsn string, pool PoolConfig) (*Store, error) {
 			return nil, fmt.Errorf("enable WAL: %w", err)
 		}
 	}
+
+	// PostgreSQL: set search_path to "public" and enable client-side statement
+	// caching (pgx default); no extra setup required for AutoMigrate.
 
 	if err := model.MigrateAll(db); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)

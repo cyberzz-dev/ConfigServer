@@ -16,7 +16,7 @@ export default function UsersPage() {
   const currentUser = useCurrentUser()
   const [users, setUsers]           = useState<User[]>([])
   const [roles, setRoles]           = useState<Role[]>([])
-  const [loading, setLoading]       = useState(false)
+  const [loading, setLoading]       = useState(true)
   const [createOpen, setCreateOpen] = useState(false)
   const [resetTarget, setReset]     = useState<User | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<User | null>(null)

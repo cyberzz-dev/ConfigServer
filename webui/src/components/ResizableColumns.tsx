@@ -52,13 +52,24 @@ export function useResizableColumns<T extends { width?: number | string; [key: s
 
   return columns.map((col, index) => {
     const w = widths[index] ?? (typeof col.width === 'number' ? col.width : undefined)
+    const originalHeaderCell = col.onHeaderCell
     return {
       ...col,
       width: w ?? col.width,
-      onHeaderCell: () => ({
-        width: w ?? col.width,
-        onResize: handleResize(index),
-      }),
+      onHeaderCell: (column: any) => {
+        const base = typeof originalHeaderCell === 'function' ? originalHeaderCell(column) : {}
+        return {
+          ...base,
+          width: w ?? col.width,
+          onResize: handleResize(index),
+          onClick: (e: React.MouseEvent) => {
+            // Prevent header clicks from bubbling to row onClick
+            e.stopPropagation()
+            // Call original onClick if exists
+            if (base.onClick) base.onClick(e)
+          },
+        }
+      },
     }
   })
 }

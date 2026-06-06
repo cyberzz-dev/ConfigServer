@@ -22,10 +22,12 @@ package metrics
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -125,15 +127,17 @@ func (c *Collector) Collect(ctx context.Context) (string, error) {
 		if a == nil || a.LastHeartbeat.IsZero() {
 			continue
 		}
+		labels := []labelPair{
+			{name: "type", value: a.AgentType},
+			{name: "uuid", value: a.InstanceID},
+			{name: "ip", value: a.IP},
+			{name: "hostname", value: a.Hostname},
+			{name: "version", value: a.Version},
+		}
+		labels = append(labels, parseTagsJSON(a.TagsJSON)...)
 		fmt.Fprintf(&sb,
 			"agent_hearbeat{%s} %g %d\n",
-			formatLabels([]labelPair{
-				{name: "type", value: a.AgentType},
-				{name: "uuid", value: a.InstanceID},
-				{name: "ip", value: a.IP},
-				{name: "hostname", value: a.Hostname},
-				{name: "version", value: a.Version},
-			}),
+			formatLabels(labels),
 			runningStatusValue(a.RunningStatus),
 			unixMilli(a.LastHeartbeat),
 		)
@@ -287,4 +291,41 @@ func agentLabelValue(agent *model.Agent, getter func(*model.Agent) string) strin
 		return ""
 	}
 	return getter(agent)
+}
+
+// nonAlnum matches characters not valid in a Prometheus label name.
+var nonAlnum = regexp.MustCompile(`[^a-zA-Z0-9_]`)
+
+// parseTagsJSON decodes an agent's TagsJSON field into label pairs.
+// Each tag name is sanitised to satisfy [a-zA-Z_][a-zA-Z0-9_]* and
+// prefixed with "tag_" to avoid collision with built-in labels.
+func parseTagsJSON(tagsJSON string) []labelPair {
+	if tagsJSON == "" {
+		return nil
+	}
+	var entries []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(tagsJSON), &entries); err != nil {
+		return nil
+	}
+	pairs := make([]labelPair, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		if e.Name == "" {
+			continue
+		}
+		sanitised := nonAlnum.ReplaceAllString(e.Name, "_")
+		if len(sanitised) > 0 && sanitised[0] >= '0' && sanitised[0] <= '9' {
+			sanitised = "_" + sanitised
+		}
+		label := "tag_" + sanitised
+		if _, dup := seen[label]; dup {
+			continue
+		}
+		seen[label] = struct{}{}
+		pairs = append(pairs, labelPair{name: label, value: e.Value})
+	}
+	return pairs
 }

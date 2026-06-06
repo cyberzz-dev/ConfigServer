@@ -50,12 +50,12 @@ func main() {
 	}
 
 	rdb := redis.NewUniversalClient(&redis.UniversalOptions{
-		Addrs:    []string{cfg.RedisAddr},
+		Addrs:    cfg.RedisAddrs,
 		Password: cfg.RedisPassword,
 		DB:       cfg.RedisDB,
 	})
 
-	mgr := cache.New(st, rdb, cfg.L1MaxSizeMB, cfg.L1TTL, cfg.L2TTL)
+	mgr := cache.New(st, rdb, cfg.L1MaxSizeMB, cfg.L1TTL, cfg.L2TTL, cfg.RedisHFE)
 	agentSrv := agentserver.NewAgentServer(cfg.AgentAddr(), mgr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
