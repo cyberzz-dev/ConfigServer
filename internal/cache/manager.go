@@ -117,6 +117,44 @@ func IsNotFound(err error) bool {
 	return errors.Is(err, gorm.ErrRecordNotFound)
 }
 
+// ── Redis Cluster helpers ─────────────────────────────────────────────────────
+
+// forEachMaster executes fn against every master node in Cluster mode,
+// or against the single node in Standalone/Sentinel mode.
+// This ensures SCAN-style operations that must enumerate all keys visit
+// all shards in a cluster rather than a single arbitrarily chosen node.
+func forEachMaster(ctx context.Context, rdb redis.UniversalClient, fn func(ctx context.Context, c redis.UniversalClient) error) error {
+	if cc, ok := rdb.(*redis.ClusterClient); ok {
+		return cc.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+			return fn(ctx, node)
+		})
+	}
+	return fn(ctx, rdb)
+}
+
+// clusterPublish publishes a message on the correct node.
+// In Redis Cluster mode it uses SPUBLISH (Sharded Pub/Sub, Redis ≥ 7.0) so
+// that the message is delivered on the same slot-owner node that subscribers
+// connect to via SSubscribe.  In Standalone/Sentinel mode it falls back to
+// the regular PUBLISH command.
+func clusterPublish(ctx context.Context, rdb redis.UniversalClient, channel, message string) error {
+	if cc, ok := rdb.(*redis.ClusterClient); ok {
+		return cc.SPublish(ctx, channel, message).Err()
+	}
+	return rdb.Publish(ctx, channel, message).Err()
+}
+
+// clusterSubscribe returns a *redis.PubSub that uses SSUBSCRIBE (Sharded
+// Pub/Sub) in Cluster mode and regular SUBSCRIBE in Standalone/Sentinel mode.
+// In Cluster mode SPUBLISH always routes to the slot-owning node, and
+// SSUBSCRIBE connects to that same node, so messages are never dropped.
+func clusterSubscribe(rdb redis.UniversalClient, ctx context.Context, channels ...string) *redis.PubSub {
+	if cc, ok := rdb.(*redis.ClusterClient); ok {
+		return cc.SSubscribe(ctx, channels...)
+	}
+	return rdb.Subscribe(ctx, channels...)
+}
+
 // agentConfigSet is the value stored in the resolve cache per agent.
 // It holds only config names (no Detail bytes) so the cache stays small.
 // On a cache hit the full config content is hydrated from the existing
@@ -300,7 +338,9 @@ func (m *Manager) invalidate(ctx context.Context, key string) {
 			log.Printf("WARN: cache invalidate redis del %q: %v", key, err)
 		}
 		// Publish invalidation to all other instances.
-		if err := m.rdb.Publish(ctx, pubSubChannel, key).Err(); err != nil {
+		// clusterPublish uses SPUBLISH in Cluster mode so the message reaches
+		// the correct slot-owning node where subscribers are connected.
+		if err := clusterPublish(ctx, m.rdb, pubSubChannel, key); err != nil {
 			log.Printf("WARN: cache invalidate publish %q: %v", key, err)
 		}
 	}
@@ -371,7 +411,10 @@ func (m *Manager) backfill(ctx context.Context, key string, v interface{}, versi
 // the subscription is live before New() returns and the HTTP server opens.
 func (m *Manager) subscribeInvalidations(ready chan struct{}) {
 	ctx := context.Background()
-	sub := m.rdb.Subscribe(ctx, pubSubChannel)
+	// clusterSubscribe uses SSUBSCRIBE in Cluster mode (Sharded Pub/Sub, Redis ≥ 7.0)
+	// so that the subscriber connects to the same slot-owning node that clusterPublish
+	// targets.  In Standalone/Sentinel mode it falls back to regular SUBSCRIBE.
+	sub := clusterSubscribe(m.rdb, ctx, pubSubChannel)
 	// Receive() blocks until Redis returns the subscription-confirmation message.
 	// On error we still close ready so startup is never deadlocked; the L1 TTL
 	// (5 min) acts as the backstop until connectivity is restored.
@@ -443,7 +486,7 @@ func (m *Manager) invalidateResolveCache(ctx context.Context) {
 	m.resolveEpoch.Add(1)
 	m.resolveCache.Del([]byte(keyResolveCanaries))
 	if m.rdb != nil {
-		if err := m.rdb.Publish(ctx, pubSubChannel, msgFlushResolve).Err(); err != nil {
+		if err := clusterPublish(ctx, m.rdb, pubSubChannel, msgFlushResolve); err != nil {
 			log.Printf("WARN: publish flush_resolve: %v", err)
 		}
 	}
@@ -855,19 +898,24 @@ func (m *Manager) evictStaleAgents() {
 
 	// Clean up Redis entries (distributed mode only).
 	// Each agent's entire status Hash is a single key, so one DEL per agent suffices.
+	// In Redis Cluster mode a multi-key DEL crossing slot boundaries causes a
+	// CROSSSLOT error, so we delete each key individually.
 	if m.rdb != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		delKeys := make([]string, 0, len(stale)*2)
+		deleted := 0
 		for _, id := range stale {
-			delKeys = append(delKeys, prefixAgent+id, agentHashKey(id))
-		}
-		if err := m.rdb.Del(ctx, delKeys...).Err(); err != nil {
-			log.Printf("WARN: agent GC redis del: %v", err)
+			for _, k := range []string{prefixAgent + id, agentHashKey(id)} {
+				if err := m.rdb.Del(ctx, k).Err(); err != nil {
+					log.Printf("WARN: agent GC redis del %q: %v", k, err)
+				} else {
+					deleted++
+				}
+			}
 		}
 		log.Printf("agent GC: evicted %d stale agents, deleted %d Redis keys (TTL=%s)",
-			len(stale), len(delKeys), agentTTL)
+			len(stale), deleted, agentTTL)
 	} else {
 		log.Printf("agent GC: evicted %d stale agents (TTL=%s)", len(stale), agentTTL)
 	}
@@ -909,36 +957,46 @@ func (m *Manager) ListAgents(ctx context.Context) ([]*model.Agent, error) {
 
 // listAgentsFromRedis fetches all agent entries stored in Redis by scanning
 // keys matching the "agent:*" pattern. Used in distributed mode.
+//
+// Redis Cluster compatibility:
+//   - In Cluster mode, SCAN only covers a single node and MGet across keys from
+//     different slots causes CROSSSLOT errors. We use forEachMaster to run an
+//     independent SCAN loop on every master node, then fetch each key with a
+//     single-key GET (always routed to the correct slot).
+//   - In Standalone/Sentinel mode forEachMaster is a no-op wrapper so behaviour
+//     is identical to the previous implementation.
 func (m *Manager) listAgentsFromRedis(ctx context.Context) ([]*model.Agent, error) {
+	var mu sync.Mutex
 	var agents []*model.Agent
-	var cursor uint64
-	for {
-		keys, nextCursor, err := m.rdb.Scan(ctx, cursor, prefixAgent+"*", 200).Result()
-		if err != nil {
-			return nil, err
-		}
-		if len(keys) > 0 {
-			vals, err := m.rdb.MGet(ctx, keys...).Result()
+
+	err := forEachMaster(ctx, m.rdb, func(ctx context.Context, c redis.UniversalClient) error {
+		var cursor uint64
+		for {
+			keys, nextCursor, err := c.Scan(ctx, cursor, prefixAgent+"*", 200).Result()
 			if err != nil {
-				return nil, err
+				return err
 			}
-			for _, v := range vals {
-				if v == nil {
-					continue
+			for _, key := range keys {
+				raw, err := c.Get(ctx, key).Bytes()
+				if err != nil {
+					continue // key may have expired between SCAN and GET
 				}
 				var a model.Agent
-				if err := json.Unmarshal([]byte(v.(string)), &a); err != nil {
+				if json.Unmarshal(raw, &a) != nil {
 					continue
 				}
+				mu.Lock()
 				agents = append(agents, &a)
+				mu.Unlock()
+			}
+			cursor = nextCursor
+			if cursor == 0 {
+				break
 			}
 		}
-		cursor = nextCursor
-		if cursor == 0 {
-			break
-		}
-	}
-	return agents, nil
+		return nil
+	})
+	return agents, err
 }
 
 // agentTagEntry mirrors the JSON shape of protov2.AgentGroupTag stored in TagsJSON.
@@ -1145,51 +1203,49 @@ func (m *Manager) ListAgentConfigStatuses(ctx context.Context) ([]*model.AgentCo
 }
 
 func (m *Manager) listAgentConfigStatusesFromRedis(ctx context.Context) ([]*model.AgentConfigStatus, error) {
-	// Collect all agent Hash keys via SCAN, then pipeline HGETALL for each.
-	// Pattern matches agent_status:{instanceID} (one key per agent).
+	// Redis Cluster compatibility:
+	//   - In Cluster mode, SCAN only covers a single node. A Pipeline that sends
+	//     HGetAll for keys from different slots routes commands to different nodes,
+	//     which go-redis handles correctly for ClusterClient pipelines, but a SCAN
+	//     on a single node would miss keys on other nodes.
+	//   - We use forEachMaster to run an independent SCAN + HGetAll loop on every
+	//     master node. Each HGetAll is a single-key command always routed correctly.
+	//   - In Standalone/Sentinel mode forEachMaster is a no-op wrapper, so
+	//     behaviour is identical to the previous implementation.
 	pattern := prefixStatus + "*"
 
-	var hashKeys []string
-	var cursor uint64
-	for {
-		keys, nextCursor, err := m.rdb.Scan(ctx, cursor, pattern, 200).Result()
-		if err != nil {
-			return nil, err
-		}
-		hashKeys = append(hashKeys, keys...)
-		cursor = nextCursor
-		if cursor == 0 {
-			break
-		}
-	}
-	if len(hashKeys) == 0 {
-		return nil, nil
-	}
-
-	// Pipeline all HGETALL calls to minimise round-trips.
-	pipe := m.rdb.Pipeline()
-	cmds := make([]*redis.MapStringStringCmd, len(hashKeys))
-	for i, k := range hashKeys {
-		cmds[i] = pipe.HGetAll(ctx, k)
-	}
-	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
-		return nil, err
-	}
-
+	var mu sync.Mutex
 	var statuses []*model.AgentConfigStatus
-	for _, cmd := range cmds {
-		fields, err := cmd.Result()
-		if err != nil {
-			continue
-		}
-		for _, raw := range fields {
-			var s model.AgentConfigStatus
-			if err := json.Unmarshal([]byte(raw), &s); err == nil {
-				statuses = append(statuses, &s)
+
+	err := forEachMaster(ctx, m.rdb, func(ctx context.Context, c redis.UniversalClient) error {
+		var cursor uint64
+		for {
+			keys, nextCursor, err := c.Scan(ctx, cursor, pattern, 200).Result()
+			if err != nil {
+				return err
+			}
+			for _, key := range keys {
+				fields, err := c.HGetAll(ctx, key).Result()
+				if err != nil {
+					continue // key may have expired between SCAN and HGetAll
+				}
+				mu.Lock()
+				for _, raw := range fields {
+					var s model.AgentConfigStatus
+					if json.Unmarshal([]byte(raw), &s) == nil {
+						statuses = append(statuses, &s)
+					}
+				}
+				mu.Unlock()
+			}
+			cursor = nextCursor
+			if cursor == 0 {
+				break
 			}
 		}
-	}
-	return statuses, nil
+		return nil
+	})
+	return statuses, err
 }
 
 // Ensure *Manager satisfies store.Store so it can be used anywhere a store is expected.
