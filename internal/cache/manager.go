@@ -133,7 +133,7 @@ func forEachMaster(ctx context.Context, rdb redis.UniversalClient, fn func(ctx c
 }
 
 // clusterPublish publishes a message on the correct node.
-// In Redis Cluster mode it uses SPUBLISH (Sharded Pub/Sub, Redis ≥ 7.0) so
+// In Redis Cluster mode it uses SPUBLISH (Sharded Pub/Sub, Valkey 7.2+ / Redis 7.0+) so
 // that the message is delivered on the same slot-owner node that subscribers
 // connect to via SSubscribe.  In Standalone/Sentinel mode it falls back to
 // the regular PUBLISH command.
@@ -176,7 +176,7 @@ type Manager struct {
 	l1TTL      time.Duration
 	l2TTL      time.Duration
 	sf         singleflight.Group
-	hfeEnabled bool // use HEXPIRE for per-field TTL (Valkey 9.0+ / Redis 7.4+)
+	hfeEnabled bool // use HEXPIRE for per-field TTL (Valkey 9.0+ / Redis 7.4+; recommended default: true)
 
 	// resolveCache holds per-agent config-name resolution results (agentConfigSet)
 	// keyed by [8-byte epoch LE][8-byte FNV-64a agent hash].  It is separate from
@@ -203,7 +203,7 @@ type Manager struct {
 //   - rdb == nil       → All-in-One mode (L1 + L3 only)
 //   - rdb != nil       → full three-tier mode with Pub/Sub cache invalidation
 //   - hfeEnabled=true  → use HEXPIRE for per-field TTL on agent config-status
-//     hashes (requires Valkey 9.0+ or Redis 7.4+);
+//     hashes (Valkey 9.0+ / Redis 7.4+; recommended when running Valkey 9.0+);
 //     ignored when rdb is nil.
 //
 // Call StartGC(ctx) after New to enable periodic eviction of stale agents.

@@ -34,6 +34,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"image/color"
 	"log"
 	"net/http"
 	"sync"
@@ -180,7 +181,14 @@ func (h *AdminHandler) OTPSetup(w http.ResponseWriter, r *http.Request) {
 // returns it as a data URI string ("data:image/png;base64,...").
 // On error it returns an empty string so the client can fall back to the raw URI.
 func otpQRCodeBase64(uri string) string {
-	png, err := qrcode.Encode(uri, qrcode.Medium, 256)
+	qr, err := qrcode.New(uri, qrcode.Medium)
+	if err != nil {
+		return ""
+	}
+	qr.ForegroundColor = color.RGBA{R: 0x06, G: 0x4e, B: 0x5a, A: 0xff}
+	qr.BackgroundColor = color.RGBA{R: 0xf7, G: 0xfb, B: 0xfc, A: 0xff}
+
+	png, err := qr.PNG(256)
 	if err != nil {
 		return ""
 	}

@@ -123,6 +123,35 @@ body {
   color: var(--brand-word-3);
 }
 
+/* Two-factor setup QR code */
+.totp-qr-panel {
+  width: fit-content;
+  margin: 0 auto 16px;
+  padding: 14px;
+  border: 1px solid rgba(19, 168, 168, 0.22);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(22, 119, 255, 0.08), rgba(19, 168, 168, 0.12)),
+    #ffffff;
+  box-shadow: 0 8px 24px rgba(15, 107, 122, 0.14);
+}
+
+.totp-qr-image {
+  display: block;
+  width: 200px;
+  height: 200px;
+  border-radius: 6px;
+  background: #f7fbfc;
+}
+
+[data-theme="dark"] .totp-qr-panel {
+  border-color: rgba(138, 180, 248, 0.24);
+  background:
+    linear-gradient(135deg, rgba(138, 180, 248, 0.16), rgba(102, 217, 217, 0.12)),
+    #2f3033;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
+}
+
 /* ── Page transition ─────────────────────────────────────────────────────── */
 @keyframes page-fade-in {
   from {
