@@ -65,10 +65,11 @@ admin_server:
 
 # ── Metrics ───────────────────────────────────────────────────
 metrics:
-  # Remote write endpoint for Prometheus text metrics.
-  # Supports Victoria Metrics agent push or Prometheus Pushgateway.
+  # Prometheus Remote Write endpoint.
   # Leave empty to disable remote push; /metrics is always available.
-  push_url: ""                 # e.g. "http://vmagent:8429/api/v1/import/prometheus"
+  push_url: ""                 # e.g. "http://vmagent:8429/api/v1/write"
+  push_username: ""            # Optional Basic Auth username
+  push_password: ""            # Optional Basic Auth password
   push_interval: 30s           # How often to push metrics to push_url
   online_window: 5m            # Agents with heartbeat older than this are counted as offline
 

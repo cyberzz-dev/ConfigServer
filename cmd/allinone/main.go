@@ -67,7 +67,7 @@ func main() {
 	defer stop()
 
 	// Start metrics push loop if a remote endpoint is configured.
-	mc.StartPush(ctx, cfg.MetricsPushURL, cfg.MetricsPushInterval)
+	mc.StartPush(ctx, cfg.MetricsPushURL, cfg.MetricsPushUsername, cfg.MetricsPushPassword, cfg.MetricsPushInterval)
 	// Start background GC for stale agents (TTL 30 min, scan every 5 min).
 	mgr.StartGC(ctx)
 

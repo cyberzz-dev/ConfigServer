@@ -4,18 +4,18 @@ import dayjs from 'dayjs'
 import type { AuditLog } from '../api'
 import { listAuditLogs } from '../api'
 
-const ACTION_COLORS: Record<string, string> = {
-  create: 'green',
-  update: 'blue',
-  delete: 'red',
-  rollback: 'purple',
+const ACTION_CLASS: Record<string, string> = {
+  create: 'action-create',
+  update: 'action-update',
+  delete: 'action-delete',
+  rollback: 'action-rollback',
 }
 
-const TYPE_COLORS: Record<string, string> = {
-  pipeline: 'geekblue',
-  instance: 'cyan',
-  onetime: 'orange',
-  group: 'gold',
+const TYPE_CLASS: Record<string, string> = {
+  pipeline: 'type-pipeline',
+  instance: 'type-instance',
+  onetime: 'type-onetime',
+  group: 'type-group',
 }
 
 export default function AuditPage() {
@@ -46,11 +46,11 @@ export default function AuditPage() {
     { title: 'User', dataIndex: 'username', key: 'username', width: 130 },
     {
       title: 'Action', dataIndex: 'action', key: 'action', width: 100,
-      render: (v: string) => <Tag color={ACTION_COLORS[v] ?? 'default'}>{v}</Tag>,
+      render: (v: string) => <Tag className={ACTION_CLASS[v] ?? 'action-unknown'}>{v || 'unknown'}</Tag>,
     },
     {
       title: 'Resource Type', dataIndex: 'resource_type', key: 'resource_type', width: 130,
-      render: (v: string) => <Tag color={TYPE_COLORS[v] ?? 'default'}>{v}</Tag>,
+      render: (v: string) => <Tag className={TYPE_CLASS[v] ?? 'type-unknown'}>{v || 'unknown'}</Tag>,
     },
     { title: 'Resource Name', dataIndex: 'resource_name', key: 'resource_name', width: 220, ellipsis: true },
     {

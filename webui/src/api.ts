@@ -273,6 +273,7 @@ export const getAgentDetail = (instanceID: string) =>
 // Onetime commands
 export interface OnetimeCommand {
   name: string
+  version: number
   detail: string
   expire_time: number
   created_at: string

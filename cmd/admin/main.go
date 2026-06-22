@@ -71,7 +71,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	mc.StartPush(ctx, cfg.MetricsPushURL, cfg.MetricsPushInterval)
+	mc.StartPush(ctx, cfg.MetricsPushURL, cfg.MetricsPushUsername, cfg.MetricsPushPassword, cfg.MetricsPushInterval)
 	mgr.StartGC(ctx)
 
 	go func() {

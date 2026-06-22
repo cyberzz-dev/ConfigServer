@@ -66,7 +66,7 @@ type AgentGroupTag struct {
 type PipelineConfig struct {
 	Name      string `gorm:"primaryKey"`
 	Version   int64  `gorm:"not null"`
-	Detail    []byte `gorm:"type:blob"`
+	Detail    []byte // Remove the explicit type:blob on the []byte field to allow GORM to automatically map according to the database dialect.
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -75,7 +75,7 @@ type PipelineConfig struct {
 type InstanceConfig struct {
 	Name      string `gorm:"primaryKey"`
 	Version   int64  `gorm:"not null"`
-	Detail    []byte `gorm:"type:blob"`
+	Detail    []byte // Remove the explicit type:blob on the []byte field to allow GORM to automatically map according to the database dialect.
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -83,7 +83,8 @@ type InstanceConfig struct {
 // OnetimeCommand is a command that should be delivered once to matching agents.
 type OnetimeCommand struct {
 	Name       string `gorm:"primaryKey"`
-	Detail     []byte `gorm:"type:blob"`
+	Version    int64  `gorm:"not null;default:0"`
+	Detail     []byte // Remove the explicit type:blob on the []byte field to allow GORM to automatically map according to the database dialect.
 	ExpireTime int64
 	CreatedAt  time.Time
 }
@@ -130,9 +131,9 @@ type ConfigHistory struct {
 	ID           uint64    `gorm:"primaryKey;autoIncrement"`
 	ResourceType string    `gorm:"not null;index"` // pipeline | instance | onetime | group
 	ResourceName string    `gorm:"not null;index"`
-	Version      int64     `gorm:"not null"`  // millisecond-epoch version; 0 for groups
-	Action       string    `gorm:"not null"`  // create | update | delete | rollback
-	Detail       []byte    `gorm:"type:blob"` // content snapshot (empty for delete)
+	Version      int64     `gorm:"not null"` // millisecond-epoch version; 0 for groups
+	Action       string    `gorm:"not null"` // create | update | delete | rollback
+	Detail       []byte    // Remove the explicit type:blob on the []byte field to allow GORM to automatically map according to the database dialect.
 	ChangedBy    string    `gorm:"not null"`
 	ChangedAt    time.Time `gorm:"not null;index"`
 }
@@ -165,8 +166,8 @@ const (
 type CanaryRelease struct {
 	ConfigName    string `gorm:"primaryKey"`
 	ConfigType    string `gorm:"primaryKey"` // pipeline | instance
-	CanaryDetail  []byte `gorm:"type:blob"`
-	CanaryVersion int64  `gorm:"not null"`
+	CanaryDetail  []byte
+	CanaryVersion int64 `gorm:"not null"`
 	// RolloutPercent is the percentage [0,100] of the host population that
 	// receives the canary version. Hosts are bucketed by Hostid+configName hash.
 	RolloutPercent int `gorm:"not null;default:0"`
@@ -176,11 +177,11 @@ type CanaryRelease struct {
 	// IPSelectorJSON optionally restricts the canary to agents whose IP matches.
 	// Same format as AgentGroup.IPSelectorJSON: {"ips":["10.0.0.1","10.1.0.0/16","10.2.0.1-10"]}.
 	// Empty string means no IP restriction.
-	IPSelectorJSON string `gorm:"type:varchar(8192);not null;default:''"`
+	IPSelectorJSON string `gorm:"type:text"`
 	// TagSelectorJSON optionally restricts the canary to agents carrying at least
 	// one of the listed tags (ANY-match). Format: {"tags":[{"name":"env","value":"canary"}]}.
 	// Empty string means no tag restriction.
-	TagSelectorJSON string `gorm:"type:varchar(8192);not null;default:''"`
+	TagSelectorJSON string `gorm:"type:text"`
 	Status          string `gorm:"not null;default:'rolling'"` // rolling|paused|promoted|aborted
 	CreatedBy       string `gorm:"not null;default:''"`
 	CreatedAt       time.Time

@@ -824,6 +824,7 @@ func (h *AdminHandler) GetAgent(w http.ResponseWriter, r *http.Request) {
 
 type onetimeResp struct {
 	Name       string `json:"name"`
+	Version    int64  `json:"version"`
 	Detail     string `json:"detail"`
 	ExpireTime int64  `json:"expire_time"`
 	CreatedAt  string `json:"created_at"`
@@ -832,6 +833,7 @@ type onetimeResp struct {
 func onetimeToResp(c *model.OnetimeCommand) onetimeResp {
 	return onetimeResp{
 		Name:       c.Name,
+		Version:    c.Version,
 		Detail:     string(c.Detail),
 		ExpireTime: c.ExpireTime,
 		CreatedAt:  c.CreatedAt.Format(time.RFC3339),
@@ -867,6 +869,7 @@ func (h *AdminHandler) CreateOnetimeCommand(w http.ResponseWriter, r *http.Reque
 	}
 	cmd := &model.OnetimeCommand{
 		Name:       req.Name,
+		Version:    time.Now().UnixMilli(),
 		Detail:     []byte(req.Detail),
 		ExpireTime: req.ExpireTime,
 	}
@@ -1651,6 +1654,7 @@ func (h *AdminHandler) RollbackConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		cmd := &model.OnetimeCommand{
 			Name:       name,
+			Version:    newVersion,
 			Detail:     []byte(snap.Detail),
 			ExpireTime: snap.ExpireTime,
 		}
