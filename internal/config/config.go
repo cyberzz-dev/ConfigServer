@@ -15,6 +15,7 @@ package config
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -64,10 +65,12 @@ type Config struct {
 	AdminPort int
 
 	// Metrics
-	// MetricsPushURL is the remote endpoint for pushing Prometheus text metrics
-	// (e.g. http://vmagent:8429/api/v1/import/prometheus or a Pushgateway URL).
+	// MetricsPushURL is the remote endpoint for pushing Prometheus metrics via Remote Write
+	// (e.g. http://vmagent:8429/api/v1/write).
 	// Leave empty to disable push; /metrics scrape endpoint is always available.
 	MetricsPushURL      string
+	MetricsPushUsername string
+	MetricsPushPassword string
 	MetricsPushInterval time.Duration
 	MetricsOnlineWindow time.Duration // heartbeat age threshold for "online" status
 
@@ -130,6 +133,8 @@ type yamlFile struct {
 	} `yaml:"admin_server"`
 	Metrics struct {
 		PushURL      string `yaml:"push_url"`
+		PushUsername string `yaml:"push_username"`
+		PushPassword string `yaml:"push_password"`
 		PushInterval string `yaml:"push_interval"`
 		OnlineWindow string `yaml:"online_window"`
 	} `yaml:"metrics"`
@@ -158,6 +163,9 @@ func Load(file string) *Config {
 		log.Printf("Loaded configuration from %s", file)
 	}
 	applyEnv(c)
+	if err := c.ValidateMetrics(); err != nil {
+		log.Fatalf("config validation: %v", err)
+	}
 	return c
 }
 
@@ -182,6 +190,8 @@ func configDefaults() *Config {
 		AdminHost:             "0.0.0.0",
 		AdminPort:             8081,
 		MetricsPushURL:        "",
+		MetricsPushUsername:   "",
+		MetricsPushPassword:   "",
 		MetricsPushInterval:   30 * time.Second,
 		MetricsOnlineWindow:   5 * time.Minute,
 		SMTP: SMTPConfig{
@@ -268,6 +278,8 @@ func applyFile(c *Config, path string) error {
 	if v := yf.Metrics.PushURL; v != "" {
 		c.MetricsPushURL = v
 	}
+	c.MetricsPushUsername = yf.Metrics.PushUsername
+	c.MetricsPushPassword = yf.Metrics.PushPassword
 	c.MetricsPushInterval = parseDur(yf.Metrics.PushInterval, c.MetricsPushInterval)
 	c.MetricsOnlineWindow = parseDur(yf.Metrics.OnlineWindow, c.MetricsOnlineWindow)
 
@@ -372,6 +384,8 @@ func applyEnv(c *Config) {
 	setStr(&c.AdminHost, "CONFIGSERVER_ADMIN_HOST")
 	setInt(&c.AdminPort, "CONFIGSERVER_ADMIN_PORT")
 	setStr(&c.MetricsPushURL, "CONFIGSERVER_METRICS_PUSH_URL")
+	setStr(&c.MetricsPushUsername, "CONFIGSERVER_METRICS_PUSH_USERNAME")
+	setStr(&c.MetricsPushPassword, "CONFIGSERVER_METRICS_PUSH_PASSWORD")
 	setDur(&c.MetricsPushInterval, "CONFIGSERVER_METRICS_PUSH_INTERVAL")
 	setDur(&c.MetricsOnlineWindow, "CONFIGSERVER_METRICS_ONLINE_WINDOW")
 	setStr(&c.SMTP.Host, "CONFIGSERVER_SMTP_HOST")
@@ -394,6 +408,26 @@ func (c *Config) RedisEnabled() bool {
 // indicating Redis Cluster mode.
 func (c *Config) RedisCluster() bool {
 	return len(c.RedisAddrs) > 1
+}
+
+// ValidateMetrics checks optional metrics push configuration.
+// Only Prometheus Remote Write endpoints are supported for push; /metrics
+// remains available separately for text-format scraping.
+func (c *Config) ValidateMetrics() error {
+	if c.MetricsPushURL == "" {
+		return nil
+	}
+	u, err := url.Parse(c.MetricsPushURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("metrics.push_url must be a valid Prometheus Remote Write URL ending with /api/v1/write")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("metrics.push_url only supports http/https Prometheus Remote Write URLs")
+	}
+	if !strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/api/v1/write") {
+		return fmt.Errorf("metrics.push_url only supports Prometheus Remote Write endpoints, for example http://vmagent:8429/api/v1/write")
+	}
+	return nil
 }
 
 // splitAddrs splits a comma-separated address string into a trimmed slice,

@@ -41,7 +41,8 @@ redis:
   #   - "redis-node3:6379"
   password: ""     # Redis AUTH password; empty = no auth
   db: 0            # Redis logical database index (0–15); ignored in cluster mode
-  # hfe: true      # Hash Field Expiry — requires Valkey 9.0+ or Redis 7.4+.
+  hfe: true        # Hash Field Expiry (HEXPIRE) — Valkey 9.0+ / Redis 7.4+.
+                   # Set to false only when connecting to Redis < 7.4.
 
 # ── In-process cache (L1 freecache) ──────────────────────────
 cache:
@@ -64,10 +65,11 @@ admin_server:
 
 # ── Metrics ───────────────────────────────────────────────────
 metrics:
-  # Remote write endpoint for Prometheus text metrics.
-  # Supports Victoria Metrics agent push or Prometheus Pushgateway.
+  # Prometheus Remote Write endpoint.
   # Leave empty to disable remote push; /metrics is always available.
-  push_url: ""                 # e.g. "http://vmagent:8429/api/v1/import/prometheus"
+  push_url: ""                 # e.g. "http://vmagent:8429/api/v1/write"
+  push_username: ""            # Optional Basic Auth username
+  push_password: ""            # Optional Basic Auth password
   push_interval: 30s           # How often to push metrics to push_url
   online_window: 5m            # Agents with heartbeat older than this are counted as offline
 

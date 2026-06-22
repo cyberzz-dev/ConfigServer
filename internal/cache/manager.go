@@ -28,7 +28,9 @@ package cache
 import (
 	"container/list"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +53,7 @@ import (
 const (
 	prefixPipeline = "cfg:pipeline:"
 	prefixInstance = "cfg:instance:"
+	prefixOnetime  = "cfg:onetime:"
 	prefixAgent    = "agent:"
 	prefixStatus   = "agent_status:"
 	pubSubChannel  = "configserver:invalidate"
@@ -110,6 +113,10 @@ const (
 	maxStatuses  = maxAgents * 10
 	agentTTL     = 30 * time.Minute
 	agentGCEvery = 5 * time.Minute
+
+	reconcileEvery    = 5 * time.Minute
+	reconcileLockTTL  = 10 * time.Minute
+	reconcileLockName = "cfg:reconcile_lock"
 )
 
 // IsNotFound reports whether err represents a "record not found" store error.
@@ -133,7 +140,7 @@ func forEachMaster(ctx context.Context, rdb redis.UniversalClient, fn func(ctx c
 }
 
 // clusterPublish publishes a message on the correct node.
-// In Redis Cluster mode it uses SPUBLISH (Sharded Pub/Sub, Redis ≥ 7.0) so
+// In Redis Cluster mode it uses SPUBLISH (Sharded Pub/Sub, Valkey 7.2+ / Redis 7.0+) so
 // that the message is delivered on the same slot-owner node that subscribers
 // connect to via SSubscribe.  In Standalone/Sentinel mode it falls back to
 // the regular PUBLISH command.
@@ -176,7 +183,7 @@ type Manager struct {
 	l1TTL      time.Duration
 	l2TTL      time.Duration
 	sf         singleflight.Group
-	hfeEnabled bool // use HEXPIRE for per-field TTL (Valkey 9.0+ / Redis 7.4+)
+	hfeEnabled bool // use HEXPIRE for per-field TTL (Valkey 9.0+ / Redis 7.4+; recommended default: true)
 
 	// resolveCache holds per-agent config-name resolution results (agentConfigSet)
 	// keyed by [8-byte epoch LE][8-byte FNV-64a agent hash].  It is separate from
@@ -203,7 +210,7 @@ type Manager struct {
 //   - rdb == nil       → All-in-One mode (L1 + L3 only)
 //   - rdb != nil       → full three-tier mode with Pub/Sub cache invalidation
 //   - hfeEnabled=true  → use HEXPIRE for per-field TTL on agent config-status
-//     hashes (requires Valkey 9.0+ or Redis 7.4+);
+//     hashes (Valkey 9.0+ / Redis 7.4+; recommended when running Valkey 9.0+);
 //     ignored when rdb is nil.
 //
 // Call StartGC(ctx) after New to enable periodic eviction of stale agents.
@@ -229,9 +236,7 @@ func New(st store.Store, rdb redis.UniversalClient, l1MaxMB int, l1TTL, l2TTL ti
 	return m
 }
 
-// StartGC launches a background goroutine that evicts agents whose last
-// heartbeat is older than agentTTL (30 min). It runs every agentGCEvery
-// (5 min) and exits when ctx is cancelled.
+// StartGC launches background goroutines for agent eviction and cache reconciliation.
 func (m *Manager) StartGC(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(agentGCEvery)
@@ -245,9 +250,251 @@ func (m *Manager) StartGC(ctx context.Context) {
 			}
 		}
 	}()
+
+	if m.rdb != nil {
+		go m.StartReconciler(ctx)
+	}
+}
+
+// StartReconciler runs a periodic background job to reconcile L2 cache versions
+// with the database. It uses a distributed lock so only one replica performs
+// the DB scan at a time. This prevents L2 from retaining stale data indefinitely
+// if an invalidation message was missed (e.g., due to a crash after DB write).
+func (m *Manager) StartReconciler(ctx context.Context) {
+	ticker := time.NewTicker(reconcileEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			token, ok := m.acquireReconcileLock(ctx)
+			if !ok {
+				continue
+			}
+			m.runReconcileWithLock(ctx, token)
+		}
+	}
+}
+
+func (m *Manager) reconcileCache(ctx context.Context) {
+	var pipelines []*model.PipelineConfig
+	pipelineNames := make(map[string]struct{})
+	pipelineListed := false
+	if p, err := m.st.ListPipelineConfigs(ctx); err == nil {
+		pipelineListed = true
+		pipelines = p
+		for _, cfg := range pipelines {
+			pipelineNames[cfg.Name] = struct{}{}
+		}
+	} else {
+		log.Printf("WARN: reconcile list pipeline configs: %v", err)
+	}
+
+	var instances []*model.InstanceConfig
+	instanceNames := make(map[string]struct{})
+	instanceListed := false
+	if i, err := m.st.ListInstanceConfigs(ctx); err == nil {
+		instanceListed = true
+		instances = i
+		for _, cfg := range instances {
+			instanceNames[cfg.Name] = struct{}{}
+		}
+	} else {
+		log.Printf("WARN: reconcile list instance configs: %v", err)
+	}
+
+	if err := m.backfillOnetimeVersions(ctx); err != nil {
+		log.Printf("WARN: reconcile backfill onetime versions: %v", err)
+	}
+	var onetimes []*model.OnetimeCommand
+	onetimeNames := make(map[string]struct{})
+	onetimeListed := false
+	if i, err := m.st.ListOnetimeCommands(ctx); err == nil {
+		onetimeListed = true
+		onetimes = i
+		for _, cfg := range onetimes {
+			onetimeNames[cfg.Name] = struct{}{}
+		}
+	} else {
+		log.Printf("WARN: reconcile list onetime commands: %v", err)
+	}
+
+	for _, cfg := range pipelines {
+		key := prefixPipeline + cfg.Name
+		raw, err := m.rdb.Get(ctx, key).Bytes()
+		if err != nil {
+			continue // Not in L2 or command failed, normal.
+		}
+		var cached model.PipelineConfig
+		if json.Unmarshal(raw, &cached) == nil && cached.Version != cfg.Version {
+			log.Printf("WARN: reconcile found stale L2 data for pipeline %q (L2: %d, DB: %d)", cfg.Name, cached.Version, cfg.Version)
+			m.invalidate(ctx, prefixPipeline+cfg.Name)
+		}
+	}
+
+	for _, cfg := range instances {
+		key := prefixInstance + cfg.Name
+		raw, err := m.rdb.Get(ctx, key).Bytes()
+		if err != nil {
+			continue // Not in L2 or command failed, normal.
+		}
+		var cached model.InstanceConfig
+		if json.Unmarshal(raw, &cached) == nil && cached.Version != cfg.Version {
+			log.Printf("WARN: reconcile found stale L2 data for instance %q (L2: %d, DB: %d)", cfg.Name, cached.Version, cfg.Version)
+			m.invalidate(ctx, prefixInstance+cfg.Name)
+		}
+	}
+
+	for _, cfg := range onetimes {
+		key := prefixOnetime + cfg.Name
+		raw, err := m.rdb.Get(ctx, key).Bytes()
+		if err != nil {
+			continue // Not in L2 or command failed, normal.
+		}
+		var cached model.OnetimeCommand
+		if json.Unmarshal(raw, &cached) == nil {
+			cachedVersion := onetimeCacheVersion(&cached)
+			dbVersion := onetimeCacheVersion(cfg)
+			if cachedVersion != dbVersion {
+				log.Printf("WARN: reconcile found stale L2 data for onetime command %q (L2: %d, DB: %d)", cfg.Name, cachedVersion, dbVersion)
+				m.invalidate(ctx, prefixOnetime+cfg.Name)
+			}
+		}
+	}
+
+	if pipelineListed {
+		m.cleanupDeletedConfigCacheKeys(ctx, prefixPipeline, pipelineNames)
+	}
+	if instanceListed {
+		m.cleanupDeletedConfigCacheKeys(ctx, prefixInstance, instanceNames)
+	}
+	if onetimeListed {
+		m.cleanupDeletedConfigCacheKeys(ctx, prefixOnetime, onetimeNames)
+	}
 }
 
 // ── Read helpers ──────────────────────────────────────────────────────────────
+
+var reconcileLockReleaseScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+
+var reconcileLockRenewScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+`)
+
+func (m *Manager) acquireReconcileLock(ctx context.Context) (string, bool) {
+	token, err := randomHexToken(16)
+	if err != nil {
+		log.Printf("WARN: reconcile lock token: %v", err)
+		return "", false
+	}
+	acquired, err := m.rdb.SetNX(ctx, reconcileLockName, token, reconcileLockTTL).Result()
+	if err != nil {
+		log.Printf("WARN: acquire reconcile lock: %v", err)
+		return "", false
+	}
+	return token, acquired
+}
+
+func (m *Manager) runReconcileWithLock(ctx context.Context, token string) {
+	lockCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	done := make(chan struct{})
+	go m.renewReconcileLock(lockCtx, token, done, cancel)
+	defer func() {
+		close(done)
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer releaseCancel()
+		if err := reconcileLockReleaseScript.Run(releaseCtx, m.rdb, []string{reconcileLockName}, token).Err(); err != nil {
+			log.Printf("WARN: release reconcile lock: %v", err)
+		}
+	}()
+
+	m.reconcileCache(lockCtx)
+}
+
+func (m *Manager) renewReconcileLock(ctx context.Context, token string, done <-chan struct{}, cancel context.CancelFunc) {
+	interval := reconcileLockTTL / 3
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	ttlMillis := int64(reconcileLockTTL / time.Millisecond)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			n, err := reconcileLockRenewScript.Run(ctx, m.rdb, []string{reconcileLockName}, token, ttlMillis).Int()
+			if err != nil || n != 1 {
+				log.Printf("WARN: lost reconcile lock, stopping current reconcile run: renewed=%d err=%v", n, err)
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+func randomHexToken(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (m *Manager) cleanupDeletedConfigCacheKeys(ctx context.Context, prefix string, existing map[string]struct{}) {
+	pattern := prefix + "*"
+	if err := forEachMaster(ctx, m.rdb, func(ctx context.Context, c redis.UniversalClient) error {
+		var cursor uint64
+		for {
+			keys, nextCursor, err := c.Scan(ctx, cursor, pattern, 200).Result()
+			if err != nil {
+				return err
+			}
+			for _, key := range keys {
+				name := strings.TrimPrefix(key, prefix)
+				if _, ok := existing[name]; ok {
+					continue
+				}
+				log.Printf("WARN: reconcile found deleted DB config still in L2: %s", key)
+				m.invalidate(ctx, key)
+			}
+			cursor = nextCursor
+			if cursor == 0 {
+				break
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Printf("WARN: reconcile scan deleted cache keys %s: %v", pattern, err)
+	}
+}
+
+type onetimeVersionBackfiller interface {
+	BackfillOnetimeCommandVersions(ctx context.Context) error
+}
+
+func (m *Manager) backfillOnetimeVersions(ctx context.Context) error {
+	st, ok := m.st.(onetimeVersionBackfiller)
+	if !ok {
+		return nil
+	}
+	return st.BackfillOnetimeCommandVersions(ctx)
+}
 
 // GetPipelineConfig fetches a pipeline config through the cache tiers.
 func (m *Manager) GetPipelineConfig(ctx context.Context, name string) (*model.PipelineConfig, error) {
@@ -319,6 +566,63 @@ func (m *Manager) GetInstanceConfig(ctx context.Context, name string) (*model.In
 	return cfg, nil
 }
 
+// GetOnetimeCommand fetches a onetime command through the cache tiers.
+func (m *Manager) GetOnetimeCommand(ctx context.Context, name string) (*model.OnetimeCommand, error) {
+	key := prefixOnetime + name
+
+	// L1 hit?
+	if raw, err := m.l1.Get([]byte(key)); err == nil {
+		var cmd model.OnetimeCommand
+		if err := json.Unmarshal(raw, &cmd); err == nil {
+			return &cmd, nil
+		}
+	}
+
+	// L2 hit?
+	if m.rdb != nil {
+		if raw, err := m.rdb.Get(ctx, key).Bytes(); err == nil {
+			var cmd model.OnetimeCommand
+			if err := json.Unmarshal(raw, &cmd); err == nil {
+				m.l1Set(key, raw)
+				return &cmd, nil
+			}
+		}
+	}
+
+	// L3 with singleflight.
+	v, err, _ := m.sf.Do(key, func() (interface{}, error) {
+		return m.st.GetOnetimeCommand(ctx, name)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Onetime commands are a special case: they don't have a Version field in the DB
+	// schema, so we derive a version for cache consistency purposes based on the
+	// CreatedAt timestamp.  If CreatedAt is zero or the version is already set
+	// (e.g., by a backfill), we skip the backfill to avoid overwriting a valid
+	// version with zero.
+	cfg := v.(*model.OnetimeCommand)
+	if cfg.Version == 0 {
+		cfg.Version = onetimeCacheVersion(cfg)
+	}
+	m.backfill(ctx, key, cfg, onetimeCacheVersion(cfg))
+	return cfg, nil
+}
+
+func onetimeCacheVersion(cfg *model.OnetimeCommand) int64 {
+	if cfg == nil {
+		return 0
+	}
+	if cfg.Version > 0 {
+		return cfg.Version
+	}
+	if !cfg.CreatedAt.IsZero() {
+		return cfg.CreatedAt.UnixNano()
+	}
+	return 0
+}
+
 // ── Write helpers (invalidation) ──────────────────────────────────────────────
 
 // InvalidatePipelineConfig removes a pipeline config from all cache tiers.
@@ -336,6 +640,8 @@ func (m *Manager) invalidate(ctx context.Context, key string) {
 	if m.rdb != nil {
 		if err := m.rdb.Del(ctx, key).Err(); err != nil {
 			log.Printf("WARN: cache invalidate redis del %q: %v", key, err)
+			// Fallback: expire in 5 minutes to prevent stale data lingering
+			_ = m.rdb.Expire(ctx, key, 5*time.Minute).Err()
 		}
 		// Publish invalidation to all other instances.
 		// clusterPublish uses SPUBLISH in Cluster mode so the message reaches
@@ -371,16 +677,18 @@ func (m *Manager) l1Set(key string, raw []byte) {
 // KEYS[1] = cache key
 // ARGV[1] = serialised JSON value
 // ARGV[2] = TTL in seconds
-// ARGV[3] = new version (int); 0 means "always write" (no version field)
+// ARGV[3] = new version (int)
 var backfillScript = redis.NewScript(`
 local ver = tonumber(ARGV[3])
-if ver and ver > 0 then
-    local cur = redis.call('GET', KEYS[1])
-    if cur ~= false then
-        local ok, obj = pcall(cjson.decode, cur)
-        if ok and type(obj) == 'table' and type(obj.Version) == 'number' and obj.Version >= ver then
-            return 0
-        end
+if not ver or ver <= 0 then
+    -- Strictly require a version to prevent ABA races.
+    return 0
+end
+local cur = redis.call('GET', KEYS[1])
+if cur ~= false then
+    local ok, obj = pcall(cjson.decode, cur)
+    if ok and type(obj) == 'table' and type(obj.Version) == 'number' and obj.Version >= ver then
+        return 0
     end
 end
 redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
@@ -389,8 +697,7 @@ return 1
 
 // backfill populates L1 and (when Redis is available) L2 after an L3 read.
 // version must be the model's Version field so the Lua CAS script can reject
-// writes that would overwrite a newer value; pass 0 for models without a
-// version (e.g. OnetimeCommand), which falls back to an unconditional SET.
+// writes that would overwrite a newer value. If version is 0, the write is skipped.
 func (m *Manager) backfill(ctx context.Context, key string, v interface{}, version int64) {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -416,13 +723,26 @@ func (m *Manager) subscribeInvalidations(ready chan struct{}) {
 	// targets.  In Standalone/Sentinel mode it falls back to regular SUBSCRIBE.
 	sub := clusterSubscribe(m.rdb, ctx, pubSubChannel)
 	// Receive() blocks until Redis returns the subscription-confirmation message.
-	// On error we still close ready so startup is never deadlocked; the L1 TTL
-	// (5 min) acts as the backstop until connectivity is restored.
+	// On error we still close ready so startup is never deadlocked.
 	if _, err := sub.Receive(ctx); err != nil {
 		log.Printf("WARN: cache pubsub subscribe confirmation: %v", err)
 	}
 	close(ready)
-	for msg := range sub.Channel() {
+
+	// We use ReceiveMessage in a loop rather than Channel() because we need to
+	// explicitly detect connection drops/reconnects (returned as errors).
+	// When a reconnect occurs, we might have missed invalidate messages,
+	// so we defensively flush the entire L1 cache.
+	for {
+		msg, err := sub.ReceiveMessage(ctx)
+		if err != nil {
+			log.Printf("WARN: pubsub receive error: %v, flushing L1 to prevent stale data", err)
+			m.l1.Clear()
+			m.resolveEpoch.Add(1)
+			m.resolveCache.Del([]byte(keyResolveCanaries))
+			time.Sleep(time.Second) // backoff
+			continue
+		}
 		if msg.Payload == msgFlushResolve {
 			// A peer replica performed a structural write; bump the local epoch
 			// so our cached agent-resolution entries are superseded on next lookup.
@@ -596,7 +916,7 @@ func (m *Manager) hydrateAgentConfigSet(ctx context.Context, aset agentConfigSet
 
 	onetimes := make([]*model.OnetimeCommand, 0, len(aset.Onetime))
 	for _, name := range aset.Onetime {
-		cmd, err := m.st.GetOnetimeCommand(ctx, name)
+		cmd, err := m.GetOnetimeCommand(ctx, name)
 		if err != nil {
 			if IsNotFound(err) {
 				continue
@@ -768,16 +1088,26 @@ func (m *Manager) DeleteInstanceConfig(ctx context.Context, name string) error {
 }
 
 func (m *Manager) CreateOnetimeCommand(ctx context.Context, cmd *model.OnetimeCommand) error {
-	return m.st.CreateOnetimeCommand(ctx, cmd)
-}
-func (m *Manager) GetOnetimeCommand(ctx context.Context, name string) (*model.OnetimeCommand, error) {
-	return m.st.GetOnetimeCommand(ctx, name)
+	if cmd.Version == 0 {
+		cmd.Version = time.Now().UnixMilli()
+	}
+	if err := m.st.CreateOnetimeCommand(ctx, cmd); err != nil {
+		return err
+	}
+	m.invalidate(ctx, prefixOnetime+cmd.Name)
+	m.invalidateResolveCache(ctx)
+	return nil
 }
 func (m *Manager) ListOnetimeCommands(ctx context.Context) ([]*model.OnetimeCommand, error) {
 	return m.st.ListOnetimeCommands(ctx)
 }
 func (m *Manager) DeleteOnetimeCommand(ctx context.Context, name string) error {
-	return m.st.DeleteOnetimeCommand(ctx, name)
+	if err := m.st.DeleteOnetimeCommand(ctx, name); err != nil {
+		return err
+	}
+	m.invalidate(ctx, prefixOnetime+name)
+	m.invalidateResolveCache(ctx)
+	return nil
 }
 
 // ── In-memory agent storage (resets on restart) ─────────────────────────────

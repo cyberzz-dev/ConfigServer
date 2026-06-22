@@ -23,10 +23,10 @@ const STATUS_CLASS: Record<number, string> = {
   4: 'status-deleted',
 }
 
-const TYPE_COLORS: Record<string, string> = {
-  pipeline: 'geekblue',
-  instance: 'cyan',
-  onetime:  'orange',
+const TYPE_CLASS: Record<string, string> = {
+  pipeline: 'type-pipeline',
+  instance: 'type-instance',
+  onetime:  'type-onetime',
 }
 
 function ConfigStatusTable({ instanceID }: { instanceID: string }) {
@@ -49,7 +49,7 @@ function ConfigStatusTable({ instanceID }: { instanceID: string }) {
   const cols = [
     { title: 'Config', dataIndex: 'ConfigName', key: 'ConfigName' },
     { title: 'Type', dataIndex: 'ConfigType', key: 'ConfigType', width: 110,
-      render: (v: string) => <Tag color={TYPE_COLORS[v] ?? 'default'}>{v || 'unknown'}</Tag> },
+      render: (v: string) => <Tag className={TYPE_CLASS[v] ?? 'type-unknown'}>{v || 'unknown'}</Tag> },
 
     {
       title: (

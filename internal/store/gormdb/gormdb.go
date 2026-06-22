@@ -346,6 +346,28 @@ func (s *Store) ListOnetimeCommands(ctx context.Context) ([]*model.OnetimeComman
 	return cmds, s.db.WithContext(ctx).Find(&cmds).Error
 }
 
+// BackfillOnetimeCommandVersions assigns stable versions to legacy onetime
+// commands created before OnetimeCommand.Version existed.
+func (s *Store) BackfillOnetimeCommandVersions(ctx context.Context) error {
+	var cmds []*model.OnetimeCommand
+	if err := s.db.WithContext(ctx).Where("version = 0").Find(&cmds).Error; err != nil {
+		return err
+	}
+	for _, cmd := range cmds {
+		version := cmd.CreatedAt.UnixNano()
+		if version <= 0 {
+			version = time.Now().UnixNano()
+		}
+		if err := s.db.WithContext(ctx).
+			Model(&model.OnetimeCommand{}).
+			Where("name = ? AND version = 0", cmd.Name).
+			Update("version", version).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) DeleteOnetimeCommand(ctx context.Context, name string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Delete(&model.OnetimeCommand{}, "name = ?", name).Error; err != nil {

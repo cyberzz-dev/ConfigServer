@@ -964,15 +964,10 @@ function OnetimePanel() {
       dataIndex: 'detail', key: 'detail',
       width: 300, ellipsis: true,
       render: (v: string) => {
-        if (!v) return <span style={{ color: '#999' }}>-</span>
+        if (!v) return <span className="detail-empty">-</span>
         const preview = v.length > 80 ? v.slice(0, 80) + '…' : v
         return (
-          <code style={{
-            cursor: 'default', fontSize: 11, color: '#1677ff',
-            background: 'rgba(22,119,255,0.08)',
-            padding: '2px 6px', borderRadius: 3,
-            fontFamily: 'monospace', whiteSpace: 'nowrap',
-          }}>{preview}</code>
+          <code className="detail-preview">{preview}</code>
         )
       },
     },

@@ -534,11 +534,11 @@ function AppLayout({ onLogout, theme, themeMode, onCycleTheme }: {
             Then enter the 6-digit code to confirm.
           </Typography.Paragraph>
           {totpSetupData.qr_code ? (
-            <div style={{ textAlign: 'center', marginBottom: 16 }}>
+            <div className="totp-qr-panel">
               <img
                 src={totpSetupData.qr_code}
                 alt="TOTP QR Code"
-                style={{ width: 200, height: 200, border: '1px solid #f0f0f0', borderRadius: 8 }}
+                className="totp-qr-image"
               />
             </div>
           ) : null}

@@ -40,9 +40,10 @@ redis:
   #   - "redis-node3:6379"
   password: ""          # Redis AUTH password; empty = no auth
   db: 0                 # Redis logical database index (0–15); ignored in cluster mode
-  # hfe: true           # Hash Field Expiry — requires Valkey 9.0+ or Redis 7.4+.
-  #                     # When enabled each config-status field gets its own TTL
-  #                     # (HEXPIRE) so stale per-config entries expire independently.
+  hfe: true             # Hash Field Expiry (HEXPIRE) — Valkey 9.0+ / Redis 7.4+.
+                        # Each config-status field gets its own per-field TTL so that
+                        # stale per-config entries expire independently of the agent hash.
+                        # Set to false only when connecting to Redis < 7.4.
 
 # ── In-process cache (L1 freecache) ──────────────────────────
 cache:
@@ -67,7 +68,10 @@ admin_server:
 
 # ── Metrics ───────────────────────────────────────────────────
 metrics:
-  push_url: ""                 # e.g. "http://vmagent:8429/api/v1/import/prometheus"
+  # Prometheus Remote Write endpoint. Leave empty to disable push.
+  push_url: ""                 # e.g. "http://vmagent:8429/api/v1/write"
+  push_username: ""            # Optional Basic Auth username
+  push_password: ""            # Optional Basic Auth password
   push_interval: 30s
   online_window: 5m            # Agents silent longer than this are counted as offline
 

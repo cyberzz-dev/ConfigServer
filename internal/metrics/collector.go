@@ -15,13 +15,15 @@
 //     layer if the deployment cannot tolerate per-agent cardinality.
 //
 // Scrape: /metrics on the admin server (no auth, served alongside the WebUI).
-// Push:   start Collector.StartPush to periodically POST to a remote endpoint
-//
-//	(vmagent /api/v1/import/prometheus or Prometheus Pushgateway).
+// Push:   start Collector.StartPush to periodically POST Prometheus Remote Write
+// payloads to an endpoint such as /api/v1/write.
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,6 +36,9 @@ import (
 	"time"
 
 	"github.com/alibaba/ilogtail/config_server/internal/model"
+	"github.com/golang/snappy"
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/redis/go-redis/v9"
 )
 
 // AgentLister is satisfied by *cache.Manager.
@@ -46,6 +51,7 @@ type AgentLister interface {
 type Collector struct {
 	agents       AgentLister
 	onlineWindow time.Duration
+	pushRDB      redis.UniversalClient
 }
 
 // New creates a Collector.
@@ -54,7 +60,11 @@ func New(agents AgentLister, onlineWindow time.Duration) *Collector {
 	if onlineWindow <= 0 {
 		onlineWindow = 5 * time.Minute
 	}
-	return &Collector{agents: agents, onlineWindow: onlineWindow}
+	c := &Collector{agents: agents, onlineWindow: onlineWindow}
+	if provider, ok := agents.(interface{ RedisClient() redis.UniversalClient }); ok {
+		c.pushRDB = provider.RedisClient()
+	}
+	return c
 }
 
 // Collect returns Prometheus text exposition for the current agent snapshot.
@@ -121,8 +131,10 @@ func (c *Collector) Collect(ctx context.Context) (string, error) {
 		fmt.Fprintf(&sb, "configserver_agents_by_type{agent_type=%q} %d\n", typ, typeCounts[typ])
 	}
 
-	sb.WriteString("# HELP agent_hearbeat Agent heartbeat status by agent labels. Value is running status (running/online/ok=1, other=0 when non-numeric) and timestamp is LastHeartbeat.\n")
+	sb.WriteString("# HELP agent_hearbeat Agent online heartbeat by agent labels. Value is 1 when LastHeartbeat is within the online window, otherwise 0.\n")
 	sb.WriteString("# TYPE agent_hearbeat gauge\n")
+	sb.WriteString("# HELP agent_last_heartbeat_timestamp_seconds Last heartbeat Unix timestamp by agent labels.\n")
+	sb.WriteString("# TYPE agent_last_heartbeat_timestamp_seconds gauge\n")
 	for _, a := range agents {
 		if a == nil || a.LastHeartbeat.IsZero() {
 			continue
@@ -135,38 +147,159 @@ func (c *Collector) Collect(ctx context.Context) (string, error) {
 			{name: "version", value: a.Version},
 		}
 		labels = append(labels, parseTagsJSON(a.TagsJSON)...)
+		formattedLabels := formatLabels(labels)
 		fmt.Fprintf(&sb,
-			"agent_hearbeat{%s} %g %d\n",
-			formatLabels(labels),
-			runningStatusValue(a.RunningStatus),
-			unixMilli(a.LastHeartbeat),
+			"agent_hearbeat{%s} %g\n",
+			formattedLabels,
+			agentOnlineValue(now, a.LastHeartbeat, c.onlineWindow),
+		)
+		fmt.Fprintf(&sb,
+			"agent_last_heartbeat_timestamp_seconds{%s} %d\n",
+			formattedLabels,
+			a.LastHeartbeat.Unix(),
 		)
 	}
 
-	sb.WriteString("# HELP agent_config Agent config apply status by config and agent labels. Value is config status and timestamp is UpdatedAt.\n")
+	sb.WriteString("# HELP agent_config Agent config apply status by config and agent labels.\n")
 	sb.WriteString("# TYPE agent_config gauge\n")
+	sb.WriteString("# HELP agent_config_updated_timestamp_seconds Last config status update Unix timestamp by config and agent labels.\n")
+	sb.WriteString("# TYPE agent_config_updated_timestamp_seconds gauge\n")
 	for _, s := range statuses {
 		if s == nil || s.UpdatedAt.IsZero() {
 			continue
 		}
 		agent := agentsByID[s.InstanceID]
+		labels := formatLabels([]labelPair{
+			{name: "config_name", value: s.ConfigName},
+			{name: "config_type", value: s.ConfigType},
+			{name: "agent_type", value: agentLabelValue(agent, func(a *model.Agent) string { return a.AgentType })},
+			{name: "agent_uuid", value: s.InstanceID},
+			{name: "agent_ip", value: agentLabelValue(agent, func(a *model.Agent) string { return a.IP })},
+			{name: "agent_hostname", value: agentLabelValue(agent, func(a *model.Agent) string { return a.Hostname })},
+			{name: "agent_version", value: agentLabelValue(agent, func(a *model.Agent) string { return a.Version })},
+		})
 		fmt.Fprintf(&sb,
-			"agent_config{%s} %d %d\n",
-			formatLabels([]labelPair{
-				{name: "config_name", value: s.ConfigName},
-				{name: "config_type", value: s.ConfigType},
-				{name: "agent_type", value: agentLabelValue(agent, func(a *model.Agent) string { return a.AgentType })},
-				{name: "agent_uuid", value: s.InstanceID},
-				{name: "agent_ip", value: agentLabelValue(agent, func(a *model.Agent) string { return a.IP })},
-				{name: "agent_hostname", value: agentLabelValue(agent, func(a *model.Agent) string { return a.Hostname })},
-				{name: "agent_version", value: agentLabelValue(agent, func(a *model.Agent) string { return a.Version })},
-			}),
+			"agent_config{%s} %d\n",
+			labels,
 			s.Status,
-			unixMilli(s.UpdatedAt),
+		)
+		fmt.Fprintf(&sb,
+			"agent_config_updated_timestamp_seconds{%s} %d\n",
+			labels,
+			s.UpdatedAt.Unix(),
 		)
 	}
 
 	return sb.String(), nil
+}
+
+// CollectProto returns the current agent snapshot as Prometheus TimeSeries protobuf objects.
+// This is used for the Remote Write protocol.
+func (c *Collector) CollectProto(ctx context.Context) ([]prompb.TimeSeries, error) {
+	agents, err := c.agents.ListAgents(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list agents: %w", err)
+	}
+	statuses, err := c.agents.ListAgentConfigStatuses(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list agent config statuses: %w", err)
+	}
+
+	now := time.Now()
+	var total, online int
+
+	statusCounts := map[string]int{}
+	typeCounts := map[string]int{}
+	agentsByID := make(map[string]*model.Agent, len(agents))
+
+	for _, a := range agents {
+		if a == nil {
+			continue
+		}
+		agentsByID[a.InstanceID] = a
+		total++
+		if now.Sub(a.LastHeartbeat) <= c.onlineWindow {
+			online++
+		}
+		if a.RunningStatus != "" {
+			statusCounts[a.RunningStatus]++
+		}
+		if a.AgentType != "" {
+			typeCounts[a.AgentType]++
+		}
+	}
+
+	var series []prompb.TimeSeries
+	ts := now.UnixMilli()
+
+	addMetric := func(name string, labels map[string]string, value float64, timestamp int64) {
+		if timestamp == 0 {
+			timestamp = ts
+		}
+		promLabels := make([]prompb.Label, 0, len(labels)+1)
+		promLabels = append(promLabels, prompb.Label{Name: "__name__", Value: name})
+		for k, v := range labels {
+			promLabels = append(promLabels, prompb.Label{Name: k, Value: v})
+		}
+		// Sort labels to comply with Prometheus Remote Write requirements
+		sort.Slice(promLabels, func(i, j int) bool {
+			return promLabels[i].Name < promLabels[j].Name
+		})
+
+		series = append(series, prompb.TimeSeries{
+			Labels:  promLabels,
+			Samples: []prompb.Sample{{Value: value, Timestamp: timestamp}},
+		})
+	}
+
+	addMetric("configserver_agents_total", nil, float64(total), 0)
+	addMetric("configserver_agents_online_total", nil, float64(online), 0)
+
+	for _, status := range sortedKeys(statusCounts) {
+		addMetric("configserver_agents_by_status", map[string]string{"status": status}, float64(statusCounts[status]), 0)
+	}
+
+	for _, typ := range sortedKeys(typeCounts) {
+		addMetric("configserver_agents_by_type", map[string]string{"agent_type": typ}, float64(typeCounts[typ]), 0)
+	}
+
+	for _, a := range agents {
+		if a == nil || a.LastHeartbeat.IsZero() {
+			continue
+		}
+		lbls := map[string]string{
+			"type":     a.AgentType,
+			"uuid":     a.InstanceID,
+			"ip":       a.IP,
+			"hostname": a.Hostname,
+			"version":  a.Version,
+		}
+		for _, lp := range parseTagsJSON(a.TagsJSON) {
+			lbls[lp.name] = lp.value
+		}
+		addMetric("agent_hearbeat", lbls, agentOnlineValue(now, a.LastHeartbeat, c.onlineWindow), 0)
+		addMetric("agent_last_heartbeat_timestamp_seconds", lbls, float64(a.LastHeartbeat.Unix()), 0)
+	}
+
+	for _, s := range statuses {
+		if s == nil || s.UpdatedAt.IsZero() {
+			continue
+		}
+		agent := agentsByID[s.InstanceID]
+		lbls := map[string]string{
+			"config_name":    s.ConfigName,
+			"config_type":    s.ConfigType,
+			"agent_type":     agentLabelValue(agent, func(a *model.Agent) string { return a.AgentType }),
+			"agent_uuid":     s.InstanceID,
+			"agent_ip":       agentLabelValue(agent, func(a *model.Agent) string { return a.IP }),
+			"agent_hostname": agentLabelValue(agent, func(a *model.Agent) string { return a.Hostname }),
+			"agent_version":  agentLabelValue(agent, func(a *model.Agent) string { return a.Version }),
+		}
+		addMetric("agent_config", lbls, float64(s.Status), 0)
+		addMetric("agent_config_updated_timestamp_seconds", lbls, float64(s.UpdatedAt.Unix()), 0)
+	}
+
+	return series, nil
 }
 
 // Handler returns an http.Handler that serves the current metrics snapshot in
@@ -184,10 +317,10 @@ func (c *Collector) Handler() http.Handler {
 }
 
 // StartPush begins pushing metrics to pushURL every interval until ctx is
-// cancelled.  pushURL should be the full remote endpoint, for example:
-//   - vmagent:  http://vmagent:8429/api/v1/import/prometheus
-//   - Pushgateway: http://pushgw:9091/metrics/job/configserver
-func (c *Collector) StartPush(ctx context.Context, pushURL string, interval time.Duration) {
+// cancelled. Optional username/password configure HTTP Basic Auth. pushURL
+// should be the full remote endpoint for Remote Write, for example:
+//   - vmagent:  http://vmagent:8429/api/v1/write
+func (c *Collector) StartPush(ctx context.Context, pushURL, username, password string, interval time.Duration) {
 	if pushURL == "" {
 		return
 	}
@@ -200,7 +333,7 @@ func (c *Collector) StartPush(ctx context.Context, pushURL string, interval time
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := c.push(ctx, pushURL); err != nil {
+				if err := c.pushWithLease(ctx, pushURL, username, password, interval); err != nil {
 					log.Printf("WARN: metrics push to %s: %v", pushURL, err)
 				}
 			}
@@ -208,23 +341,74 @@ func (c *Collector) StartPush(ctx context.Context, pushURL string, interval time
 	}()
 }
 
-func (c *Collector) push(ctx context.Context, url string) error {
-	text, err := c.Collect(ctx)
-	if err != nil {
-		return fmt.Errorf("collect: %w", err)
+var metricsPushLockReleaseScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+
+func (c *Collector) pushWithLease(ctx context.Context, url, username, password string, interval time.Duration) error {
+	if c.pushRDB == nil {
+		return c.push(ctx, url, username, password)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(text))
+	token, err := randomHexToken(16)
+	if err != nil {
+		return fmt.Errorf("metrics push lock token: %w", err)
+	}
+	ttl := interval * 2
+	if ttl < time.Minute {
+		ttl = time.Minute
+	}
+	acquired, err := c.pushRDB.SetNX(ctx, "configserver:metrics:push_lock", token, ttl).Result()
+	if err != nil {
+		return fmt.Errorf("acquire metrics push lock: %w", err)
+	}
+	if !acquired {
+		return nil
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := metricsPushLockReleaseScript.Run(releaseCtx, c.pushRDB, []string{"configserver:metrics:push_lock"}, token).Err(); err != nil {
+			log.Printf("WARN: release metrics push lock: %v", err)
+		}
+	}()
+	return c.push(ctx, url, username, password)
+}
+
+func (c *Collector) push(ctx context.Context, url, username, password string) error {
+	series, err := c.CollectProto(ctx)
+	if err != nil {
+		return fmt.Errorf("collect proto: %w", err)
+	}
+	if len(series) == 0 {
+		return nil
+	}
+	req := &prompb.WriteRequest{Timeseries: series}
+	data, err := req.Marshal()
+	if err != nil {
+		return fmt.Errorf("marshal prompb: %w", err)
+	}
+	compressed := snappy.Encode(nil, data)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(compressed))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	resp, err := http.DefaultClient.Do(req)
+	httpReq.Header.Set("Content-Encoding", "snappy")
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	httpReq.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+	if username != "" || password != "" {
+		httpReq.SetBasicAuth(username, password)
+	}
+	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("http post: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("remote returned HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("remote returned HTTP %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
 }
@@ -284,6 +468,24 @@ func runningStatusValue(status string) float64 {
 	default:
 		return 0
 	}
+}
+
+func agentOnlineValue(now, lastHeartbeat time.Time, onlineWindow time.Duration) float64 {
+	if lastHeartbeat.IsZero() {
+		return 0
+	}
+	if now.Sub(lastHeartbeat) <= onlineWindow {
+		return 1
+	}
+	return 0
+}
+
+func randomHexToken(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func agentLabelValue(agent *model.Agent, getter func(*model.Agent) string) string {

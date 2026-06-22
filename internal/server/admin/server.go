@@ -30,6 +30,12 @@ var gzipPool = sync.Pool{
 	New: func() any { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w },
 }
 
+const (
+	immutableAssetCacheControl = "public, max-age=31536000, immutable"
+	staticAssetCacheControl    = "public, max-age=86400"
+	noCacheControl             = "no-cache"
+)
+
 // gzipResponseWriter wraps http.ResponseWriter to compress the response body.
 type gzipResponseWriter struct {
 	http.ResponseWriter
@@ -80,6 +86,36 @@ func gzipMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func isStaticAssetPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".js", ".mjs", ".css", ".map",
+		".png", ".svg", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
+		".woff", ".woff2", ".ttf", ".otf", ".eot",
+		".wasm":
+		return true
+	default:
+		return false
+	}
+}
+
+// staticCacheMiddleware applies cache headers for the embedded WebUI.
+// Vite emits content-hashed files under /assets, so those can be cached
+// aggressively. Other static assets get a shorter cache in case they are
+// served with stable filenames. The SPA entry point must be revalidated so
+// deployments can switch users to the newest asset manifest.
+func staticCacheMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			w.Header().Set("Cache-Control", immutableAssetCacheControl)
+		} else if isStaticAssetPath(r.URL.Path) {
+			w.Header().Set("Cache-Control", staticAssetCacheControl)
+		} else {
+			w.Header().Set("Cache-Control", noCacheControl)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // AdminServer serves the REST API and the embedded React WebUI.
 type AdminServer struct {
 	srv *http.Server
@@ -108,13 +144,14 @@ func NewAdminServer(addr string, mgr *cache.Manager, webFS fs.FS, metricsHandler
 
 	// Serve the React SPA.
 	if webFS != nil {
-		static := gzipMiddleware(http.FileServerFS(webFS))
+		static := gzipMiddleware(staticCacheMiddleware(http.FileServerFS(webFS)))
 		// All non-API requests fall through to the SPA so that client-side
 		// routing works correctly (index.html for any unknown path).
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			// Try to serve the actual file; if not found, serve index.html.
 			f, err := webFS.Open(r.URL.Path[1:]) // strip leading "/"
 			if err != nil {
+				w.Header().Set("Cache-Control", noCacheControl)
 				http.ServeFileFS(w, r, webFS, "index.html")
 				return
 			}
