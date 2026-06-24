@@ -477,6 +477,19 @@ WHERE matched.matched_count >= 1
 			}
 		}
 	}
+	// Groups with only a version constraint (no tag/IP selector) should still
+	// participate in matching, then be filtered by the version check below.
+	var versionGroups []*model.AgentGroup
+	if err := s.db.WithContext(ctx).
+		Select("name").
+		Where("version_constraint <> ''").
+		Find(&versionGroups).Error; err != nil {
+		return nil, nil, nil, fmt.Errorf("GetConfigsForAgent version group query: %w", err)
+	}
+	for _, group := range versionGroups {
+		groupNameSet[group.Name] = struct{}{}
+	}
+
 	// Apply version constraint filtering: for each non-default group that has a
 	// VersionConstraint, exclude the group if the agent's version doesn't satisfy it.
 	if len(groupNameSet) > 1 { // more than just default
