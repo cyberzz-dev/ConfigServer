@@ -10,6 +10,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -172,6 +173,8 @@ func ok(w http.ResponseWriter, data any) { writeJSON(w, http.StatusOK, 0, "ok", 
 
 func badRequest(w http.ResponseWriter, msg string) { writeJSON(w, http.StatusBadRequest, 1, msg, nil) }
 
+func conflict(w http.ResponseWriter, msg string) { writeJSON(w, http.StatusConflict, 1, msg, nil) }
+
 func notFound(w http.ResponseWriter) { writeJSON(w, http.StatusNotFound, 1, "not found", nil) }
 
 func decodeJSON(r *http.Request, v any) error {
@@ -262,12 +265,31 @@ func (h *AdminHandler) CreatePipelineConfig(w http.ResponseWriter, r *http.Reque
 		badRequest(w, err.Error())
 		return
 	}
+	if existing, err := h.mgr.GetPipelineConfig(r.Context(), req.Name); err == nil {
+		if bytes.Equal(existing.Detail, []byte(req.Detail)) {
+			ok(w, pipelineToResp(existing))
+			return
+		}
+		conflict(w, fmt.Sprintf("pipeline config %q already exists", req.Name))
+		return
+	} else if !isNotFound(err) {
+		internalError(w, err)
+		return
+	}
 	cfg := &model.PipelineConfig{
 		Name:    req.Name,
 		Version: time.Now().UnixMilli(),
 		Detail:  []byte(req.Detail),
 	}
 	if err := h.mgr.CreatePipelineConfig(r.Context(), cfg); err != nil {
+		if existing, err2 := h.mgr.GetPipelineConfig(r.Context(), req.Name); err2 == nil {
+			if bytes.Equal(existing.Detail, []byte(req.Detail)) {
+				ok(w, pipelineToResp(existing))
+				return
+			}
+			conflict(w, fmt.Sprintf("pipeline config %q already exists", req.Name))
+			return
+		}
 		internalError(w, err)
 		return
 	}
@@ -313,6 +335,10 @@ func (h *AdminHandler) UpdatePipelineConfig(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	oldDetail := cfg.Detail
+	if bytes.Equal(oldDetail, []byte(req.Detail)) {
+		ok(w, pipelineToResp(cfg))
+		return
+	}
 	cfg.Detail = []byte(req.Detail)
 	cfg.Version = time.Now().UnixMilli()
 	if err := h.mgr.UpdatePipelineConfig(r.Context(), cfg); err != nil {
@@ -327,10 +353,16 @@ func (h *AdminHandler) UpdatePipelineConfig(w http.ResponseWriter, r *http.Reque
 func (h *AdminHandler) DeletePipelineConfig(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	// Snapshot content before deletion so it can be restored via rollback.
-	var snapDetail []byte
-	if cfg, err2 := h.mgr.GetPipelineConfig(r.Context(), name); err2 == nil {
-		snapDetail = cfg.Detail
+	cfg, err := h.mgr.GetPipelineConfig(r.Context(), name)
+	if err != nil {
+		if isNotFound(err) {
+			ok(w, nil)
+			return
+		}
+		internalError(w, err)
+		return
 	}
+	snapDetail := cfg.Detail
 	if err := h.mgr.DeletePipelineConfig(r.Context(), name); err != nil {
 		internalError(w, err)
 		return
@@ -372,12 +404,31 @@ func (h *AdminHandler) CreateInstanceConfig(w http.ResponseWriter, r *http.Reque
 		badRequest(w, err.Error())
 		return
 	}
+	if existing, err := h.mgr.GetInstanceConfig(r.Context(), req.Name); err == nil {
+		if bytes.Equal(existing.Detail, []byte(req.Detail)) {
+			ok(w, instanceToResp(existing))
+			return
+		}
+		conflict(w, fmt.Sprintf("instance config %q already exists", req.Name))
+		return
+	} else if !isNotFound(err) {
+		internalError(w, err)
+		return
+	}
 	cfg := &model.InstanceConfig{
 		Name:    req.Name,
 		Version: time.Now().UnixMilli(),
 		Detail:  []byte(req.Detail),
 	}
 	if err := h.mgr.CreateInstanceConfig(r.Context(), cfg); err != nil {
+		if existing, err2 := h.mgr.GetInstanceConfig(r.Context(), req.Name); err2 == nil {
+			if bytes.Equal(existing.Detail, []byte(req.Detail)) {
+				ok(w, instanceToResp(existing))
+				return
+			}
+			conflict(w, fmt.Sprintf("instance config %q already exists", req.Name))
+			return
+		}
 		internalError(w, err)
 		return
 	}
@@ -423,6 +474,10 @@ func (h *AdminHandler) UpdateInstanceConfig(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	oldDetail := cfg.Detail
+	if bytes.Equal(oldDetail, []byte(req.Detail)) {
+		ok(w, instanceToResp(cfg))
+		return
+	}
 	cfg.Detail = []byte(req.Detail)
 	cfg.Version = time.Now().UnixMilli()
 	if err := h.mgr.UpdateInstanceConfig(r.Context(), cfg); err != nil {
@@ -437,10 +492,16 @@ func (h *AdminHandler) UpdateInstanceConfig(w http.ResponseWriter, r *http.Reque
 func (h *AdminHandler) DeleteInstanceConfig(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	// Snapshot content before deletion so it can be restored via rollback.
-	var snapDetail []byte
-	if cfg, err2 := h.mgr.GetInstanceConfig(r.Context(), name); err2 == nil {
-		snapDetail = cfg.Detail
+	cfg, err := h.mgr.GetInstanceConfig(r.Context(), name)
+	if err != nil {
+		if isNotFound(err) {
+			ok(w, nil)
+			return
+		}
+		internalError(w, err)
+		return
 	}
+	snapDetail := cfg.Detail
 	if err := h.mgr.DeleteInstanceConfig(r.Context(), name); err != nil {
 		internalError(w, err)
 		return
@@ -867,6 +928,17 @@ func (h *AdminHandler) CreateOnetimeCommand(w http.ResponseWriter, r *http.Reque
 		badRequest(w, "name is required")
 		return
 	}
+	if existing, err := h.mgr.GetOnetimeCommand(r.Context(), req.Name); err == nil {
+		if bytes.Equal(existing.Detail, []byte(req.Detail)) && existing.ExpireTime == req.ExpireTime {
+			ok(w, onetimeToResp(existing))
+			return
+		}
+		conflict(w, fmt.Sprintf("onetime command %q already exists", req.Name))
+		return
+	} else if !isNotFound(err) {
+		internalError(w, err)
+		return
+	}
 	cmd := &model.OnetimeCommand{
 		Name:       req.Name,
 		Version:    time.Now().UnixMilli(),
@@ -874,6 +946,14 @@ func (h *AdminHandler) CreateOnetimeCommand(w http.ResponseWriter, r *http.Reque
 		ExpireTime: req.ExpireTime,
 	}
 	if err := h.mgr.CreateOnetimeCommand(r.Context(), cmd); err != nil {
+		if existing, err2 := h.mgr.GetOnetimeCommand(r.Context(), req.Name); err2 == nil {
+			if bytes.Equal(existing.Detail, []byte(req.Detail)) && existing.ExpireTime == req.ExpireTime {
+				ok(w, onetimeToResp(existing))
+				return
+			}
+			conflict(w, fmt.Sprintf("onetime command %q already exists", req.Name))
+			return
+		}
 		internalError(w, err)
 		return
 	}
@@ -899,14 +979,19 @@ func (h *AdminHandler) GetOnetimeCommand(w http.ResponseWriter, r *http.Request)
 func (h *AdminHandler) DeleteOnetimeCommand(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	// Snapshot content before deletion so it can be restored via rollback.
-	var snapDetail []byte
-	if cmd, err2 := h.mgr.GetOnetimeCommand(r.Context(), name); err2 == nil {
-		snap, _ := json.Marshal(struct {
-			Detail     string `json:"detail"`
-			ExpireTime int64  `json:"expire_time"`
-		}{Detail: string(cmd.Detail), ExpireTime: cmd.ExpireTime})
-		snapDetail = snap
+	cmd, err := h.mgr.GetOnetimeCommand(r.Context(), name)
+	if err != nil {
+		if isNotFound(err) {
+			ok(w, nil)
+			return
+		}
+		internalError(w, err)
+		return
 	}
+	snapDetail, _ := json.Marshal(struct {
+		Detail     string `json:"detail"`
+		ExpireTime int64  `json:"expire_time"`
+	}{Detail: string(cmd.Detail), ExpireTime: cmd.ExpireTime})
 	if err := h.mgr.DeleteOnetimeCommand(r.Context(), name); err != nil {
 		internalError(w, err)
 		return
@@ -1770,6 +1855,14 @@ func canaryToResp(cr *model.CanaryRelease) canaryResp {
 	return resp
 }
 
+func sameCanaryPayload(cr *model.CanaryRelease, detail string, rolloutPercent int, versionConstraint, ipSelectorJSON, tagSelectorJSON string) bool {
+	return bytes.Equal(cr.CanaryDetail, []byte(detail)) &&
+		cr.RolloutPercent == rolloutPercent &&
+		cr.VersionConstraint == versionConstraint &&
+		cr.IPSelectorJSON == ipSelectorJSON &&
+		cr.TagSelectorJSON == tagSelectorJSON
+}
+
 // configTypeFromPath maps the URL {type} path value to model config-type constants.
 // Valid values: "pipeline" → model.ConfigTypePipeline, "instance" → model.ConfigTypeInstance.
 func configTypeFromPath(raw string) (string, bool) {
@@ -1883,13 +1976,25 @@ func (h *AdminHandler) CreateCanary(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	} else if existing != nil {
-		writeJSON(w, http.StatusConflict, 1,
-			fmt.Sprintf("a canary release for '%s' already exists (status: %s); abort or promote it before creating a new one", name, existing.Status),
-			nil)
+		if existing.Status == model.CanaryStatusRolling &&
+			sameCanaryPayload(existing, req.CanaryDetail, req.RolloutPercent, req.VersionConstraint, ipSelectorJSON, tagSelectorJSON) {
+			ok(w, canaryToResp(existing))
+			return
+		}
+		conflict(w, fmt.Sprintf("a canary release for '%s' already exists (status: %s); abort or promote it before creating a new one", name, existing.Status))
 		return
 	}
 
 	if err := h.mgr.CreateCanary(r.Context(), cr); err != nil {
+		if existing, err2 := h.mgr.GetCanary(r.Context(), name, cfgType); err2 == nil && existing != nil {
+			if existing.Status == model.CanaryStatusRolling &&
+				sameCanaryPayload(existing, req.CanaryDetail, req.RolloutPercent, req.VersionConstraint, ipSelectorJSON, tagSelectorJSON) {
+				ok(w, canaryToResp(existing))
+				return
+			}
+			conflict(w, fmt.Sprintf("a canary release for '%s' already exists (status: %s); abort or promote it before creating a new one", name, existing.Status))
+			return
+		}
 		internalError(w, err)
 		return
 	}
@@ -1979,8 +2084,15 @@ func (h *AdminHandler) UpdateCanary(w http.ResponseWriter, r *http.Request) {
 		tagSelectorJSON = string(raw)
 	}
 
+	if sameCanaryPayload(cr, req.CanaryDetail, req.RolloutPercent, req.VersionConstraint, ipSelectorJSON, tagSelectorJSON) {
+		ok(w, canaryToResp(cr))
+		return
+	}
+
+	if !bytes.Equal(cr.CanaryDetail, []byte(req.CanaryDetail)) {
+		cr.CanaryVersion = time.Now().UnixMilli()
+	}
 	cr.CanaryDetail = []byte(req.CanaryDetail)
-	cr.CanaryVersion = time.Now().UnixMilli()
 	cr.RolloutPercent = req.RolloutPercent
 	cr.VersionConstraint = req.VersionConstraint
 	cr.IPSelectorJSON = ipSelectorJSON
@@ -2010,7 +2122,7 @@ func (h *AdminHandler) GetCanary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cr == nil {
-		notFound(w)
+		ok(w, map[string]string{"status": "promoted"})
 		return
 	}
 	ok(w, canaryToResp(cr))
@@ -2053,6 +2165,10 @@ func (h *AdminHandler) SetCanaryPercent(w http.ResponseWriter, r *http.Request) 
 		badRequest(w, fmt.Sprintf("canary is not in rolling status (current: %s)", cr.Status))
 		return
 	}
+	if cr.RolloutPercent == req.RolloutPercent {
+		ok(w, canaryToResp(cr))
+		return
+	}
 	cr.RolloutPercent = req.RolloutPercent
 	if err := h.mgr.UpdateCanary(r.Context(), cr); err != nil {
 		internalError(w, err)
@@ -2093,6 +2209,10 @@ func (h *AdminHandler) setCanaryStatus(w http.ResponseWriter, r *http.Request, r
 		notFound(w)
 		return
 	}
+	if cr.Status == newStatus {
+		ok(w, canaryToResp(cr))
+		return
+	}
 	if cr.Status != requiredCurrent {
 		badRequest(w, fmt.Sprintf("canary must be in '%s' status to perform this action (current: %s)", requiredCurrent, cr.Status))
 		return
@@ -2126,7 +2246,7 @@ func (h *AdminHandler) PromoteCanary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cr == nil {
-		notFound(w)
+		ok(w, map[string]string{"status": "promoted"})
 		return
 	}
 
@@ -2142,13 +2262,15 @@ func (h *AdminHandler) PromoteCanary(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		oldDetail := cfg.Detail
-		cfg.Detail = cr.CanaryDetail
-		cfg.Version = time.Now().UnixMilli()
-		if err2 := h.mgr.UpdatePipelineConfig(ctx, cfg); err2 != nil {
-			internalError(w, err2)
-			return
+		if !bytes.Equal(oldDetail, cr.CanaryDetail) {
+			cfg.Detail = cr.CanaryDetail
+			cfg.Version = time.Now().UnixMilli()
+			if err2 := h.mgr.UpdatePipelineConfig(ctx, cfg); err2 != nil {
+				internalError(w, err2)
+				return
+			}
+			h.saveHistory(ctx, "pipeline", name, "promote", cfg.Version, oldDetail)
 		}
-		h.saveHistory(ctx, "pipeline", name, "promote", cfg.Version, oldDetail)
 
 	case model.ConfigTypeInstance:
 		cfg, err2 := h.mgr.GetInstanceConfig(ctx, name)
@@ -2161,13 +2283,15 @@ func (h *AdminHandler) PromoteCanary(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		oldDetail := cfg.Detail
-		cfg.Detail = cr.CanaryDetail
-		cfg.Version = time.Now().UnixMilli()
-		if err2 := h.mgr.UpdateInstanceConfig(ctx, cfg); err2 != nil {
-			internalError(w, err2)
-			return
+		if !bytes.Equal(oldDetail, cr.CanaryDetail) {
+			cfg.Detail = cr.CanaryDetail
+			cfg.Version = time.Now().UnixMilli()
+			if err2 := h.mgr.UpdateInstanceConfig(ctx, cfg); err2 != nil {
+				internalError(w, err2)
+				return
+			}
+			h.saveHistory(ctx, "instance", name, "promote", cfg.Version, oldDetail)
 		}
-		h.saveHistory(ctx, "instance", name, "promote", cfg.Version, oldDetail)
 	}
 
 	if err := h.mgr.DeleteCanary(ctx, name, cfgType); err != nil {
@@ -2195,7 +2319,7 @@ func (h *AdminHandler) AbortCanary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cr == nil {
-		notFound(w)
+		ok(w, map[string]string{"status": "aborted"})
 		return
 	}
 	if err := h.mgr.DeleteCanary(r.Context(), name, cfgType); err != nil {
